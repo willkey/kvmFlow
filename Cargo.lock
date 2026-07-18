@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-diagnostics"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "kvmflow-domain",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-domain"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "kvmflow-diagnostics",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-macos-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kvmflow-diagnostics",
  "kvmflow-domain",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-platform-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kvmflow-domain",
  "thiserror 2.0.18",
@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-platform-macos"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "core-foundation",
  "core-graphics",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-platform-windows"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kvmflow-domain",
  "kvmflow-platform-api",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kvmflow-domain",
  "serde",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-transport"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "if-addrs",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "kvmflow-windows-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kvmflow-diagnostics",
  "kvmflow-domain",

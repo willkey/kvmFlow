@@ -14,9 +14,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - macos-14
-          - windows-2022
+        include:
+          - os: macos-14
+            rust_excludes: --exclude kvmflow-windows-app --exclude kvmflow-platform-windows
+          - os: windows-2022
+            rust_excludes: --exclude kvmflow-macos-app --exclude kvmflow-platform-macos
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -42,6 +44,6 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Lint Rust
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets ${{ matrix.rust_excludes }} -- -D warnings
       - name: Test Rust
-        run: cargo test --workspace
+        run: cargo test --workspace ${{ matrix.rust_excludes }}
