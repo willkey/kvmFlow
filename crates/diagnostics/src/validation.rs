@@ -234,11 +234,15 @@ pub trait ValidationReportStore: Send + Sync {
 
 pub struct ValidationStore {
     diagnostics_dir: PathBuf,
+    persist_lock: tokio::sync::Mutex<()>,
 }
 
 impl ValidationStore {
     pub fn new(diagnostics_dir: PathBuf) -> Self {
-        Self { diagnostics_dir }
+        Self {
+            diagnostics_dir,
+            persist_lock: tokio::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -255,6 +259,7 @@ pub enum ValidationStoreError {
 #[async_trait::async_trait]
 impl ValidationReportStore for ValidationStore {
     async fn persist(&self, report: &ValidationReport) -> Result<PathBuf, ValidationStoreError> {
+        let _guard = self.persist_lock.lock().await;
         let diagnostics_dir = self.diagnostics_dir.clone();
         let report = report.clone();
 
