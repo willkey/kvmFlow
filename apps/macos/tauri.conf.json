@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "kvmFlow",
+  "version": "0.1.0",
+  "identifier": "com.kvmflow.endpoint",
+  "build": {
+    "beforeBuildCommand": {
+      "script": "npm --prefix ui run build",
+      "cwd": "."
+    },
+    "frontendDist": "./ui/dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "capabilities": [
+        {
+          "identifier": "main-event-listener",
+          "windows": ["main"],
+          "permissions": [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten"
+          ]
+        }
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": [
+      "../../assets/icons/macos/32x32.png",
+      "../../assets/icons/macos/128x128.png",
+      "../../assets/icons/macos/128x128@2x.png",
+      "../../assets/icons/macos/icon.png",
+      "../../assets/icons/macos/icon.icns"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "hardenedRuntime": true
+    }
+  }
+}

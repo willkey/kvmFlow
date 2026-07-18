@@ -1,0 +1,20 @@
+[package]
+name = "kvmflow-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+kvmflow-diagnostics = { path = "../diagnostics" }
+kvmflow-domain = { path = "../domain" }
+kvmflow-platform-api = { path = "../platform-api" }
+kvmflow-transport = { path = "../transport" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,34 @@
+[package]
+name = "kvmflow-windows-app"
+build = "build.rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lib]
+name = "kvmflow_windows_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvmFlow"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+kvmflow-diagnostics.workspace = true
+kvmflow-domain.workspace = true
+kvmflow-engine.workspace = true
+kvmflow-platform-windows = { path = "../../crates/platform-windows" }
+kvmflow-transport = { path = "../../crates/transport" }
+tauri.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tauri = { workspace = true, features = ["test"] }
+tempfile.workspace = true

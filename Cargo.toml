@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/macos",
+  "apps/windows",
+  "crates/domain",
+  "crates/engine",
+  "crates/diagnostics",
+  "crates/protocol",
+  "crates/transport",
+  "crates/platform-api",
+  "crates/platform-windows",
+  "crates/platform-macos",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.96"
+authors = ["kvmFlow contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+kvmflow-diagnostics = { path = "crates/diagnostics" }
+kvmflow-domain = { path = "crates/domain" }
+kvmflow-engine = { path = "crates/engine" }
+kvmflow-protocol = { path = "crates/protocol" }
+if-addrs = "0.14"
+rand = "0.8"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sysinfo = "0.39.6"
+tauri = { version = "=2.11.2", features = ["tray-icon"] }
+tauri-build = "=2.6.2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net", "test-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

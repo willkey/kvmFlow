@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 2,
+  "role": "windowsController",
+  "phase": "running",
+  "windowState": "open",
+  "build": { "version": "0.1.0", "buildId": "fixture-build" },
+  "diagnosticNotice": null,
+  "latestResource": null,
+  "validation": {
+    "backgroundMemory": { "status": "notObserved", "current": null, "target": 52428800, "unit": "bytes" },
+    "visibleMemory": { "status": "notObserved", "current": null, "target": 188743680, "unit": "bytes" },
+    "backgroundCpu": { "status": "notObserved", "current": null, "target": 0.5, "unit": "percent" },
+    "continuousUptimeSeconds": 0,
+    "sampleCount": 0,
+    "validCpuSampleCount": 0,
+    "peakMemoryBytes": null,
+    "averageCpuPercent": null,
+    "peakCpuPercent": null
+  },
+  "kvm": {
+    "trust": "unpaired",
+    "link": "idle",
+    "control": "local",
+    "permission": "unknown",
+    "localPolicy": "allowed",
+    "screenEdge": "bottom",
+    "endpoint": null,
+    "peerDeviceName": null,
+    "pairing": null,
+    "latencyMs": null,
+    "sessionId": null,
+    "lastError": null
+  }
+}

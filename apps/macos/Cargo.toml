@@ -1,0 +1,36 @@
+[package]
+name = "kvmflow-macos-app"
+build = "build.rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lib]
+name = "kvmflow_macos_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvmFlow"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+kvmflow-diagnostics.workspace = true
+kvmflow-domain.workspace = true
+kvmflow-engine.workspace = true
+kvmflow-platform-macos = { path = "../../crates/platform-macos" }
+kvmflow-transport = { path = "../../crates/transport" }
+tauri.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+plist = "1"
+serde_json.workspace = true
+tauri = { workspace = true, features = ["test"] }
+tempfile.workspace = true
+tracing-subscriber.workspace = true

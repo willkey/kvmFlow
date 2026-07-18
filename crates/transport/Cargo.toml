@@ -1,0 +1,29 @@
+[package]
+name = "kvmflow-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+kvmflow-domain.workspace = true
+kvmflow-protocol.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+if-addrs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
