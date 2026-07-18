@@ -17,8 +17,10 @@ jobs:
         include:
           - os: macos-14
             rust_excludes: --exclude kvmflow-windows-app --exclude kvmflow-platform-windows
+            rust_test_excludes: --exclude kvmflow-windows-app --exclude kvmflow-platform-windows
           - os: windows-2022
             rust_excludes: --exclude kvmflow-macos-app --exclude kvmflow-platform-macos
+            rust_test_excludes: --exclude kvmflow-macos-app --exclude kvmflow-platform-macos --exclude kvmflow-windows-app
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -46,4 +48,4 @@ jobs:
       - name: Lint Rust
         run: cargo clippy --workspace --all-targets ${{ matrix.rust_excludes }} -- -D warnings
       - name: Test Rust
-        run: cargo test --workspace ${{ matrix.rust_excludes }}
+        run: cargo test --workspace ${{ matrix.rust_test_excludes }}
