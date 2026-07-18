@@ -8,7 +8,12 @@ on:
         required: true
         type: string
       publish:
-        description: Create the tag and public Release after signed builds pass
+        description: Create the tag and public Release after builds pass
+        required: true
+        default: false
+        type: boolean
+      sign:
+        description: Sign Windows and sign/notarize macOS (requires configured secrets)
         required: true
         default: false
         type: boolean
@@ -88,7 +93,7 @@ jobs:
     runs-on: windows-2022
     env:
       RELEASE_VERSION: ${{ inputs.version }}
-      PUBLISH_RELEASE: ${{ inputs.publish }}
+      SIGN_RELEASE: ${{ inputs.sign }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -102,7 +107,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
       - name: Import Windows signing certificate
-        if: ${{ inputs.publish }}
+        if: ${{ inputs.sign }}
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -130,7 +135,7 @@ jobs:
         shell: pwsh
         run: |
           $env:KVMFLOW_BUILD_ID = "$env:GITHUB_RUN_ID-$env:GITHUB_SHA"
-          if ($env:PUBLISH_RELEASE -eq "true") {
+          if ($env:SIGN_RELEASE -eq "true") {
             $env:TAURI_CONFIG = @{
               bundle = @{
                 windows = @{
@@ -149,7 +154,7 @@ jobs:
           if (-not $installer) {
             throw "Windows NSIS installer was not produced"
           }
-          if ($env:PUBLISH_RELEASE -eq "true") {
+          if ($env:SIGN_RELEASE -eq "true") {
             $signature = Get-AuthenticodeSignature $installer.FullName
             if ($signature.Status -ne "Valid") {
               throw "Windows installer signature is not valid: $($signature.Status)"
@@ -165,7 +170,7 @@ jobs:
           "$hash  $assetName" | Out-File `
             -FilePath "$assetPath.sha256" -Encoding ascii -NoNewline
       - name: Remove Windows signing certificate
-        if: ${{ always() && inputs.publish }}
+        if: ${{ always() && inputs.sign }}
         shell: pwsh
         run: |
           if ($env:WINDOWS_CERTIFICATE_THUMBPRINT) {
@@ -187,7 +192,7 @@ jobs:
     runs-on: macos-14
     env:
       RELEASE_VERSION: ${{ inputs.version }}
-      PUBLISH_RELEASE: ${{ inputs.publish }}
+      SIGN_RELEASE: ${{ inputs.sign }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -203,7 +208,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
       - name: Import Apple Developer ID certificate
-        if: ${{ inputs.publish }}
+        if: ${{ inputs.sign }}
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -243,7 +248,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           export KVMFLOW_BUILD_ID="$GITHUB_RUN_ID-$GITHUB_SHA"
-          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+          if [[ "$SIGN_RELEASE" == "true" ]]; then
             for variable in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
               if [[ -z "${!variable:-}" ]]; then
                 echo "$variable is required for publication" >&2
@@ -264,7 +269,7 @@ jobs:
             exit 1
           fi
           hdiutil verify "$dmg_path"
-          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+          if [[ "$SIGN_RELEASE" == "true" ]]; then
             xcrun stapler validate "$dmg_path"
             asset_name="kvmFlow_${RELEASE_VERSION}_macos_universal.dmg"
           else
@@ -277,7 +282,7 @@ jobs:
             shasum -a 256 "$asset_name" > "$asset_name.sha256"
           )
       - name: Remove temporary Apple keychain
-        if: ${{ always() && inputs.publish }}
+        if: ${{ always() && inputs.sign }}
         shell: bash
         run: |
           if [[ -n "${RELEASE_KEYCHAIN_PATH:-}" ]]; then
@@ -293,7 +298,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: Publish signed Release
+    name: Publish Release
     if: ${{ inputs.publish }}
     needs:
       - validate
@@ -307,18 +312,19 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: v${{ inputs.version }}
       RELEASE_NOTES: ${{ inputs.release_notes }}
+      SIGNED_RELEASE: ${{ inputs.sign }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Download signed installers
+      - name: Download installers
         uses: actions/download-artifact@v7
         with:
           pattern: '*-installer-${{ inputs.version }}'
           path: release-assets
           merge-multiple: true
-      - name: Verify signed asset checksums
+      - name: Verify asset checksums
         shell: bash
         run: |
           cd release-assets
@@ -354,9 +360,19 @@ jobs:
       - name: Create GitHub Release with installers
         shell: bash
         run: |
-          printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.md"
+          release_title="kvmFlow ${{ inputs.version }}"
+          if [[ "$SIGNED_RELEASE" == "true" ]]; then
+            printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.md"
+          else
+            release_title="$release_title（未签名预览版）"
+            {
+              printf '## ⚠️ 未签名安装包提示\n\n'
+              printf 'Windows 安装器未进行代码签名，可能被 Microsoft Defender SmartScreen 或 Smart App Control 拦截；macOS DMG 仅使用 ad-hoc 签名且未经过 Apple 公证，可能被系统安全机制阻止打开。请只从本仓库下载，并在核对 SHA-256 后决定是否继续安装。\n\n'
+              printf '%s\n' "$RELEASE_NOTES"
+            } > "$RUNNER_TEMP/release-notes.md"
+          fi
           gh release create "$RELEASE_TAG" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "kvmFlow ${{ inputs.version }}" \
+            --title "$release_title" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --verify-tag

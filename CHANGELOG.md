@@ -11,8 +11,8 @@
 ### 新增
 
 - 新增受门禁保护的 Release 工作流，可生成 Windows NSIS 安装器和 macOS Universal DMG。
-- 正式发布会校验签名、公证、安装包 SHA-256、main CI 和 Tag CI，再创建 GitHub Release。
-- 未配置签名凭证时只能生成明确标记为未签名或未公证的候选包，不会创建公开 Release。
+- 发布会校验安装包 SHA-256、main CI 和 Tag CI，再创建 GitHub Release。
+- 支持经明确授权发布带有风险提示的未签名预览包；签名模式仍会强制校验 Windows 签名、macOS Developer ID 签名与公证。
 
 ### 改进
 

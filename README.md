@@ -2,7 +2,7 @@
 
 kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制一台 Mac。它只传输输入事件，不传输屏幕、音频或文件，也不是远程桌面软件。
 
-> 当前开发版本为 `0.1.5`。稳定版本及可用的正式安装包请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases/latest) 下载。请仅在可信局域网中使用，不要把监听端口暴露到互联网。
+> 当前开发版本为 `0.1.5`。源码与安装包请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases/latest) 下载。请仅在可信局域网中使用，不要把监听端口暴露到互联网。
 
 ## 已实现
 
@@ -25,21 +25,26 @@ kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制�
 
 ## 下载与安装
 
-请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases/latest) 下载最新稳定版本。附带安装包的版本会提供：
+请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases/latest) 下载最新版本。`v0.1.5` 是未签名预览版，会提供：
 
-- Windows 10/11（x64）：下载 `kvmFlow_<version>_windows_x64-setup.exe`，双击运行安装程序。
-- macOS 12 或更高版本（Apple Silicon 与 Intel）：下载 `kvmFlow_<version>_macos_universal.dmg`，打开后把 kvmFlow 拖入“应用程序”。
+- Windows 10/11（x64）：`kvmFlow_0.1.5_windows_x64-setup-UNSIGNED.exe`。
+- macOS 12 或更高版本（Apple Silicon 与 Intel）：`kvmFlow_0.1.5_macos_universal-UNNOTARIZED.dmg`。
 
-正式发布的 Windows 安装包必须经过代码签名，macOS DMG 必须经过 Developer ID 签名和 Apple 公证。Actions 中名称带有 `UNSIGNED` 或 `UNNOTARIZED` 的文件仅供发布前测试，不面向普通用户。
+> [!WARNING]
+> `v0.1.5` 的 Windows 安装器没有代码签名；macOS DMG 仅使用 ad-hoc 签名，没有 Apple Developer ID 签名和公证。因此 Windows SmartScreen / Smart App Control 或 macOS 安全机制可能阻止安装或打开。请只从本项目 GitHub Releases 下载，并先核对 SHA-256；不能接受该风险时，请等待后续签名版本。
+
+Windows 出现 Microsoft Defender SmartScreen 提示时，只有确认下载来源和 SHA-256 无误后才继续；若界面提供“更多信息 -> 仍要运行”，可自行选择。启用了 Smart App Control 的设备可能直接拦截未签名应用且不提供单个应用放行，此时建议等待签名版本，不要为了安装本软件关闭系统级保护。详见 [Microsoft Smart App Control 说明](https://support.microsoft.com/en-US/Windows/Security/Threat-Malware-Protection/smart-app-control-frequently-asked-questions)。
+
+macOS 首次打开时若被阻止，请先尝试打开一次，再进入“系统设置 -> 隐私与安全性”，在“安全性”区域确认来源后选择“仍要打开”。绕过系统保护会增加风险，只应对从本仓库下载并完成校验的安装包操作。详见 [Apple 官方说明](https://support.apple.com/guide/mac-help/open-an-app-by-overriding-security-settings-mh40617/mac)。
 
 下载后可使用同名 `.sha256` 文件核对完整性：
 
 ```powershell
-certutil -hashfile .\kvmFlow_<version>_windows_x64-setup.exe SHA256
+certutil -hashfile .\kvmFlow_0.1.5_windows_x64-setup-UNSIGNED.exe SHA256
 ```
 
 ```sh
-shasum -a 256 kvmFlow_<version>_macos_universal.dmg
+shasum -a 256 kvmFlow_0.1.5_macos_universal-UNNOTARIZED.dmg
 ```
 
 ## 项目结构
