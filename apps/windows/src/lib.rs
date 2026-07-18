@@ -380,7 +380,10 @@ mod tests {
         assert_eq!(config["build"]["frontendDist"], "./ui/dist");
         assert_eq!(
             config["build"]["beforeBuildCommand"],
-            "npm --prefix ui run build"
+            json!({
+                "script": "npm --prefix ui run build",
+                "cwd": "."
+            })
         );
         assert_eq!(config["app"]["windows"], json!([]));
         assert_eq!(

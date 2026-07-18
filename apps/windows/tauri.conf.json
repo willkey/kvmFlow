@@ -4,7 +4,10 @@
   "version": "0.1.5",
   "identifier": "com.kvmflow.controller",
   "build": {
-    "beforeBuildCommand": "npm --prefix ui run build",
+    "beforeBuildCommand": {
+      "script": "npm --prefix ui run build",
+      "cwd": "."
+    },
     "frontendDist": "./ui/dist"
   },
   "app": {

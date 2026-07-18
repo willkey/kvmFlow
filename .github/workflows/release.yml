@@ -174,7 +174,7 @@ jobs:
           Remove-Item (Join-Path $env:RUNNER_TEMP "kvmflow-release-certificate.pfx") `
             -ErrorAction SilentlyContinue
       - name: Upload Windows installer
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: windows-installer-${{ inputs.version }}
           path: release-assets/*
@@ -285,7 +285,7 @@ jobs:
           fi
           rm -f "$RUNNER_TEMP/kvmflow-release-certificate.p12"
       - name: Upload macOS installer
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: macos-installer-${{ inputs.version }}
           path: release-assets/*
@@ -313,7 +313,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Download signed installers
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           pattern: '*-installer-${{ inputs.version }}'
           path: release-assets
