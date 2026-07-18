@@ -13,7 +13,7 @@ if (!requestedVersion || !/^\d+\.\d+\.\d+$/.test(requestedVersion)) {
 const errors = [];
 
 async function readText(path) {
-  return readFile(resolve(projectRoot, path), "utf8");
+  return (await readFile(resolve(projectRoot, path), "utf8")).replaceAll("\r\n", "\n");
 }
 
 async function readJson(path) {
