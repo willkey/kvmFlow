@@ -1,0 +1,365 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix, for example 0.1.5
+        required: true
+        type: string
+      publish:
+        description: Create the tag and public Release after signed builds pass
+        required: true
+        default: false
+        type: boolean
+      release_notes:
+        description: Public Release notes; required when publish is enabled
+        required: false
+        type: string
+
+permissions:
+  checks: read
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release request
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require main branch
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Release workflows must run from main." >&2
+            exit 1
+          fi
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.14.0
+          cache: npm
+      - name: Verify version consistency
+        run: node scripts/verify-release-version.mjs "${{ inputs.version }}"
+      - name: Require successful main CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          conclusions="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs" \
+            --jq '.check_runs[] | select(.name == "Verify (windows-2022)" or .name == "Verify (macos-14)") | [.name, .conclusion] | @tsv')"
+          grep -F $'Verify (windows-2022)\tsuccess' <<<"$conclusions"
+          grep -F $'Verify (macos-14)\tsuccess' <<<"$conclusions"
+      - name: Reject an existing tag or Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ inputs.version }}
+        shell: bash
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "Tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+      - name: Require public release notes
+        if: ${{ inputs.publish }}
+        env:
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        shell: bash
+        run: |
+          if [[ -z "${RELEASE_NOTES//[[:space:]]/}" ]]; then
+            echo "release_notes is required when publish is enabled." >&2
+            exit 1
+          fi
+
+  build-windows:
+    name: Build Windows installer
+    needs: validate
+    runs-on: windows-2022
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      PUBLISH_RELEASE: ${{ inputs.publish }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.14.0
+          cache: npm
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Import Windows signing certificate
+        if: ${{ inputs.publish }}
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            throw "WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD are required for publication"
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "kvmflow-release-certificate.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password | Select-Object -First 1
+          if (-not $certificate) {
+            throw "Windows signing certificate import failed"
+          }
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build Windows NSIS installer
+        shell: pwsh
+        run: |
+          $env:KVMFLOW_BUILD_ID = "$env:GITHUB_RUN_ID-$env:GITHUB_SHA"
+          if ($env:PUBLISH_RELEASE -eq "true") {
+            $env:TAURI_CONFIG = @{
+              bundle = @{
+                windows = @{
+                  certificateThumbprint = $env:WINDOWS_CERTIFICATE_THUMBPRINT
+                  digestAlgorithm = "sha256"
+                  timestampUrl = "http://timestamp.digicert.com"
+                }
+              }
+            } | ConvertTo-Json -Depth 5 -Compress
+          }
+          npm run tauri:windows:build
+      - name: Collect and verify Windows installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          if (-not $installer) {
+            throw "Windows NSIS installer was not produced"
+          }
+          if ($env:PUBLISH_RELEASE -eq "true") {
+            $signature = Get-AuthenticodeSignature $installer.FullName
+            if ($signature.Status -ne "Valid") {
+              throw "Windows installer signature is not valid: $($signature.Status)"
+            }
+            $assetName = "kvmFlow_$($env:RELEASE_VERSION)_windows_x64-setup.exe"
+          } else {
+            $assetName = "kvmFlow_$($env:RELEASE_VERSION)_windows_x64-setup-UNSIGNED.exe"
+          }
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          $assetPath = Join-Path "release-assets" $assetName
+          Copy-Item $installer.FullName $assetPath
+          $hash = (Get-FileHash -Algorithm SHA256 $assetPath).Hash.ToLowerInvariant()
+          "$hash  $assetName" | Out-File `
+            -FilePath "$assetPath.sha256" -Encoding ascii -NoNewline
+      - name: Remove Windows signing certificate
+        if: ${{ always() && inputs.publish }}
+        shell: pwsh
+        run: |
+          if ($env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+            Remove-Item "Cert:\CurrentUser\My\$env:WINDOWS_CERTIFICATE_THUMBPRINT" -ErrorAction SilentlyContinue
+          }
+          Remove-Item (Join-Path $env:RUNNER_TEMP "kvmflow-release-certificate.pfx") `
+            -ErrorAction SilentlyContinue
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v5
+        with:
+          name: windows-installer-${{ inputs.version }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos:
+    name: Build macOS installer
+    needs: validate
+    runs-on: macos-14
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      PUBLISH_RELEASE: ${{ inputs.publish }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.14.0
+          cache: npm
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Import Apple Developer ID certificate
+        if: ${{ inputs.publish }}
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          for variable in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "$variable is required for publication" >&2
+              exit 1
+            fi
+          done
+          certificate_path="$RUNNER_TEMP/kvmflow-release-certificate.p12"
+          keychain_path="$RUNNER_TEMP/kvmflow-release.keychain-db"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          identity="$(security find-identity -v -p codesigning "$keychain_path" \
+            | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          if [[ -z "$identity" ]]; then
+            echo "Developer ID Application identity was not found" >&2
+            exit 1
+          fi
+          printf 'APPLE_SIGNING_IDENTITY=%s\n' "$identity" >> "$GITHUB_ENV"
+          printf 'RELEASE_KEYCHAIN_PATH=%s\n' "$keychain_path" >> "$GITHUB_ENV"
+      - name: Build universal macOS DMG
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          export KVMFLOW_BUILD_ID="$GITHUB_RUN_ID-$GITHUB_SHA"
+          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+            for variable in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+              if [[ -z "${!variable:-}" ]]; then
+                echo "$variable is required for publication" >&2
+                exit 1
+              fi
+            done
+          else
+            export APPLE_SIGNING_IDENTITY="-"
+            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          (
+            cd apps/macos
+            cargo tauri build --target universal-apple-darwin --bundles dmg
+          )
+      - name: Collect and verify macOS installer
+        shell: bash
+        run: |
+          dmg_path="$(find target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          if [[ -z "$dmg_path" ]]; then
+            echo "macOS DMG was not produced" >&2
+            exit 1
+          fi
+          hdiutil verify "$dmg_path"
+          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+            xcrun stapler validate "$dmg_path"
+            asset_name="kvmFlow_${RELEASE_VERSION}_macos_universal.dmg"
+          else
+            asset_name="kvmFlow_${RELEASE_VERSION}_macos_universal-UNNOTARIZED.dmg"
+          fi
+          mkdir -p release-assets
+          cp "$dmg_path" "release-assets/$asset_name"
+          (
+            cd release-assets
+            shasum -a 256 "$asset_name" > "$asset_name.sha256"
+          )
+      - name: Remove temporary Apple keychain
+        if: ${{ always() && inputs.publish }}
+        shell: bash
+        run: |
+          if [[ -n "${RELEASE_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$RELEASE_KEYCHAIN_PATH" || true
+          fi
+          rm -f "$RUNNER_TEMP/kvmflow-release-certificate.p12"
+      - name: Upload macOS installer
+        uses: actions/upload-artifact@v5
+        with:
+          name: macos-installer-${{ inputs.version }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish signed Release
+    if: ${{ inputs.publish }}
+    needs:
+      - validate
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: v${{ inputs.version }}
+      RELEASE_NOTES: ${{ inputs.release_notes }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Download signed installers
+        uses: actions/download-artifact@v5
+        with:
+          pattern: '*-installer-${{ inputs.version }}'
+          path: release-assets
+          merge-multiple: true
+      - name: Verify signed asset checksums
+        shell: bash
+        run: |
+          cd release-assets
+          test "$(find . -maxdepth 1 -type f -name '*.exe' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -type f -name '*.dmg' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -type f -name '*.sha256' | wc -l)" -eq 2
+          sha256sum -c ./*.sha256
+      - name: Create annotated tag
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" -m "kvmFlow ${{ inputs.version }}"
+          git push origin "$RELEASE_TAG"
+      - name: Run and wait for tag CI
+        shell: bash
+        run: |
+          gh workflow run ci.yml --ref "$RELEASE_TAG"
+          run_id=""
+          for attempt in $(seq 1 30); do
+            run_id="$(gh run list --workflow ci.yml --branch "$RELEASE_TAG" \
+              --event workflow_dispatch --limit 1 \
+              --json databaseId,headSha \
+              --jq ".[] | select(.headSha == \"$GITHUB_SHA\") | .databaseId" | head -n 1)"
+            [[ -n "$run_id" ]] && break
+            sleep 5
+          done
+          if [[ -z "$run_id" ]]; then
+            echo "Tag CI did not start" >&2
+            exit 1
+          fi
+          gh run watch "$run_id" --exit-status
+      - name: Create GitHub Release with installers
+        shell: bash
+        run: |
+          printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "kvmFlow ${{ inputs.version }}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --verify-tag

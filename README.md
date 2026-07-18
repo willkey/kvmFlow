@@ -2,7 +2,7 @@
 
 kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制一台 Mac。它只传输输入事件，不传输屏幕、音频或文件，也不是远程桌面软件。
 
-> 当前 `0.1.4` 是开源预览版本，目标是验证 Windows 控制端到 macOS 被控端的基础连接、配对、跨屏和键鼠控制链路。请仅在可信局域网中使用，不要把监听端口暴露到互联网。
+> 当前开发版本为 `0.1.5`。稳定版本及可用的正式安装包请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases/latest) 下载。请仅在可信局域网中使用，不要把监听端口暴露到互联网。
 
 ## 已实现
 
@@ -22,6 +22,25 @@ kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制�
 - 自动发现、主机名连接和 IPv6。
 - 自定义键盘映射、按应用区分的键位方案和完整多语言界面。
 - 多台 Mac、并发会话、自动更新和正式安装器更新链路。
+
+## 下载与安装
+
+请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases/latest) 下载最新稳定版本。附带安装包的版本会提供：
+
+- Windows 10/11（x64）：下载 `kvmFlow_<version>_windows_x64-setup.exe`，双击运行安装程序。
+- macOS 12 或更高版本（Apple Silicon 与 Intel）：下载 `kvmFlow_<version>_macos_universal.dmg`，打开后把 kvmFlow 拖入“应用程序”。
+
+正式发布的 Windows 安装包必须经过代码签名，macOS DMG 必须经过 Developer ID 签名和 Apple 公证。Actions 中名称带有 `UNSIGNED` 或 `UNNOTARIZED` 的文件仅供发布前测试，不面向普通用户。
+
+下载后可使用同名 `.sha256` 文件核对完整性：
+
+```powershell
+certutil -hashfile .\kvmFlow_<version>_windows_x64-setup.exe SHA256
+```
+
+```sh
+shasum -a 256 kvmFlow_<version>_macos_universal.dmg
+```
 
 ## 项目结构
 
@@ -92,6 +111,8 @@ scripts/package-baseline-macos.sh
 ```
 
 本地开发签名不等同于 Apple Developer ID 签名或公证，不应作为面向其他用户的正式 macOS 发布签名。Windows 未签名构建也可能触发 SmartScreen 提示。
+
+维护者的候选包验收、签名配置和正式发布步骤见 [docs/RELEASING.md](docs/RELEASING.md)。
 
 ## 首次连接
 

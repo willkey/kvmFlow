@@ -6,6 +6,19 @@
 
 - 暂无。
 
+## [0.1.5] - 2026-07-19
+
+### 新增
+
+- 新增受门禁保护的 Release 工作流，可生成 Windows NSIS 安装器和 macOS Universal DMG。
+- 正式发布会校验签名、公证、安装包 SHA-256、main CI 和 Tag CI，再创建 GitHub Release。
+- 未配置签名凭证时只能生成明确标记为未签名或未公证的候选包，不会创建公开 Release。
+
+### 改进
+
+- GitHub Actions 升级到 Node.js 24 运行时版本，消除旧 Action 运行时弃用提示。
+- 新增版本一致性检查和维护者发布说明。
+
 ## [0.1.4] - 2026-07-18
 
 ### 修复
