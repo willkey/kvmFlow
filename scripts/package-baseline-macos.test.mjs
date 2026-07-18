@@ -18,7 +18,7 @@ const setup = await readFile(
 test("macOS packaging ignores untracked transfer files and filemode noise", () => {
   assert.match(script, /core\.filemode=false/);
   assert.match(script, /--untracked-files=no/);
-  assert.match(script, /cargo tauri build --bundles app/);
+  assert.match(script, /npm run tauri:macos:build -- --bundles app/);
   assert.match(script, /scripts\/sign-macos-app\.sh/);
   assert.doesNotMatch(script, /--sign -/);
 });

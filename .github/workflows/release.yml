@@ -254,10 +254,7 @@ jobs:
             export APPLE_SIGNING_IDENTITY="-"
             unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
           fi
-          (
-            cd apps/macos
-            cargo tauri build --target universal-apple-darwin --bundles dmg
-          )
+          npm run tauri:macos:build -- --target universal-apple-darwin --bundles dmg
       - name: Collect and verify macOS installer
         shell: bash
         run: |

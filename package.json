@@ -14,10 +14,10 @@
     "test:package-layout": "node --test scripts/verify-package-layout.test.mjs scripts/export-clean-package.test.mjs scripts/package-baseline-macos.test.mjs scripts/package-baseline-windows.test.mjs scripts/verify-release-version.test.mjs",
     "release:check": "node scripts/verify-release-version.mjs",
     "build": "npm run build --workspaces --if-present",
-    "tauri:windows:dev": "cd apps/windows && cargo tauri dev",
-    "tauri:windows:build": "cd apps/windows && cargo tauri build",
-    "tauri:macos:dev": "cd apps/macos && cargo tauri dev",
-    "tauri:macos:build": "cd apps/macos && cargo tauri build"
+    "tauri:windows:dev": "cd apps/windows && tauri dev",
+    "tauri:windows:build": "cd apps/windows && tauri build",
+    "tauri:macos:dev": "cd apps/macos && tauri dev",
+    "tauri:macos:build": "cd apps/macos && tauri build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.4",

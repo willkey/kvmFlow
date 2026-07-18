@@ -22,7 +22,7 @@ trap cleanup_staging_app EXIT
 export KVMFLOW_BUILD_ID="$build_id"
 (
   cd apps/macos
-  cargo tauri build --bundles app
+  npm run tauri:macos:build -- --bundles app
 )
 scripts/sign-macos-app.sh "target/release/bundle/macos/kvmFlow.app"
 
