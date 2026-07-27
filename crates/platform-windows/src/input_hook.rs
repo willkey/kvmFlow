@@ -430,11 +430,10 @@ pub fn spawn_windows_platform_adapter(
 ) -> Result<PlatformBridge, WindowsInputAdapterError> {
     let (mut driver, bridge) = platform_bridge(PLATFORM_CHANNEL_CAPACITY);
     let control = Win32HookControl::start(driver.events.clone(), edge, target_display_id)?;
-    let clipboard = ClipboardAdapter::start(driver.events.clone()).map_err(|error| {
+    let clipboard = ClipboardAdapter::start(driver.events.clone()).inspect_err(|error| {
         let _ = driver
             .events
             .try_send(PlatformEvent::ClipboardFailed(error.to_string()));
-        error
     });
     tokio::spawn(async move {
         let mut control = control;
@@ -1484,8 +1483,10 @@ mod win32 {
             return false;
         }
         let mut window_rect = RECT::default();
-        let mut monitor_info = MONITORINFO::default();
-        monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let mut monitor_info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
         if unsafe { GetWindowRect(hwnd, &mut window_rect) } == 0
             || unsafe { GetMonitorInfoW(monitor, &mut monitor_info) } == 0
         {
