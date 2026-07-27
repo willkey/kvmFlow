@@ -2,9 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   parseAppSnapshot,
-  parseKeyboardMonitorState,
+  parseDisplayTargets,
   type AppSnapshot,
-  type KeyboardMonitorState,
+  type DisplayTarget,
   type ScreenEdge,
 } from "@kvmflow/ui-contracts";
 
@@ -21,19 +21,6 @@ export async function listenForSnapshots(
       onSnapshot(parseAppSnapshot(event.payload));
     } catch {
       onMalformedSnapshot?.();
-    }
-  });
-}
-
-export async function listenForKeyboardMonitor(
-  onMonitor: (monitor: KeyboardMonitorState) => void,
-  onMalformedMonitor?: () => void,
-): Promise<UnlistenFn> {
-  return listen<unknown>("engine://keyboard", (event) => {
-    try {
-      onMonitor(parseKeyboardMonitorState(event.payload));
-    } catch {
-      onMalformedMonitor?.();
     }
   });
 }
@@ -65,6 +52,30 @@ export async function configureScreenEdge(edge: ScreenEdge): Promise<void> {
   return invoke("configure_screen_edge", { edge });
 }
 
+export async function listDisplays(): Promise<DisplayTarget[]> {
+  return parseDisplayTargets(await invoke("list_displays"));
+}
+
+export async function configureTargetDisplay(displayId: string): Promise<void> {
+  return invoke("configure_target_display", { displayId });
+}
+
 export async function returnControl(): Promise<void> {
   return invoke("return_control");
+}
+
+export async function setControlEnabled(enabled: boolean): Promise<void> {
+  return invoke("set_control_enabled", { enabled });
+}
+
+export async function setGameModeEnabled(enabled: boolean): Promise<void> {
+  return invoke("set_game_mode_enabled", { enabled });
+}
+
+export async function activateClipboardHistory(id: string): Promise<void> {
+  return invoke("activate_clipboard_history", { id });
+}
+
+export async function clearClipboardHistory(): Promise<void> {
+  return invoke("clear_clipboard_history");
 }

@@ -32,3 +32,15 @@ test("Windows packaging builds committed HEAD in a local temporary workspace", (
     /Remove-Item -LiteralPath \$stagingRoot -Recurse -Force/,
   );
 });
+
+test("Windows packaging replaces the executable at a stable path and preserves runtime data", () => {
+  assert.match(script, /\$packageRoot = Join-Path \$repoRoot "dist\/windows\/current"/);
+  assert.doesNotMatch(script, /"dist\/windows" \$buildId/);
+  assert.match(
+    script,
+    /New-Item -ItemType Directory -Path \(Join-Path \$packageRoot \$directory\) -Force/,
+  );
+  assert.match(script, /\.kvmFlow\.exe\.previous/);
+  assert.match(script, /Move-Item -LiteralPath \$nextExecutable -Destination \$executablePath/);
+  assert.match(script, /build-id\.txt/);
+});

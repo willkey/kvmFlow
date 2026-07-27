@@ -5,5 +5,6 @@
 mod input_hook;
 
 pub use input_hook::{
-    WindowsInputAdapterError, spawn_windows_platform_adapter, virtual_key_to_remote_usage,
+    WindowsInputAdapterError, available_windows_displays, spawn_windows_platform_adapter,
+    virtual_key_to_remote_usage,
 };

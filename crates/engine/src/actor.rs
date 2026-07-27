@@ -3,17 +3,21 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use kvmflow_diagnostics::{ValidationMonitor, ValidationReportStore, ValidationStoreError};
+use kvmflow_diagnostics::{
+    KvmValidationEvent, ValidationMonitor, ValidationReportStore, ValidationStoreError,
+};
 use kvmflow_domain::{
-    AppSnapshot, BuildInfo, ConnectionError, ConnectionErrorStage, ControlState, DiagnosticNotice,
-    EndpointRole, EngineEffect, EngineEvent, InputEvent, KeyboardMonitorState, LinkState,
-    LocalControlPolicy, NetworkEndpoint, PairingStatus, PermissionStatus, RuntimeState, ScreenEdge,
-    TrustState, reduce,
+    AppSnapshot, BuildInfo, ClipboardTransferState, ConnectionError, ConnectionErrorStage,
+    ControlState, DiagnosticNotice, EndpointRole, EngineEffect, EngineEvent, InputEvent,
+    KeyboardMonitorState, LinkState, LocalControlPolicy, NetworkEndpoint, PairingStatus,
+    PermissionStatus, RuntimeState, ScreenEdge, TrustState, reduce,
 };
 use kvmflow_platform_api::{
     PlatformBridge, PlatformCommand, PlatformEvent, PlatformHandle, ResourceSampler,
 };
-use kvmflow_transport::{RuntimeBridge, RuntimeCommand, RuntimeEvent, RuntimeHandle};
+use kvmflow_transport::{
+    RecoveryTrigger, RuntimeBridge, RuntimeCommand, RuntimeEvent, RuntimeHandle,
+};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, MissedTickBehavior},
@@ -37,6 +41,7 @@ pub enum EngineCommand {
     },
     ConfigureEndpoint(NetworkEndpoint),
     ConfigureScreenEdge(ScreenEdge),
+    ConfigureTargetDisplay(String),
     ConfigureListenPort(u16),
     ConfirmPairing,
     RejectPairing,
@@ -45,10 +50,15 @@ pub enum EngineCommand {
         position: f32,
     },
     ReturnControl,
+    SetControlEnabled(bool),
+    SetGameModeEnabled(bool),
+    ActivateClipboardHistory(String),
+    ClearClipboardHistory,
     SetLocalPolicy(LocalControlPolicy),
     PermissionUpdated(PermissionStatus),
     RefreshPermission,
     OpenAccessibilitySettings,
+    RecoverConnectionNow,
     ShutdownRequested {
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
@@ -237,6 +247,7 @@ async fn run_actor(
             event = receive_runtime_event(&mut runtime_events) => {
                 if let Some(event) = event {
                     update_keyboard_monitor_for_runtime_event(&keyboard_tx, &event);
+                    record_runtime_validation(&mut state, &mut monitor, &event);
                     let actions = apply_runtime_event(&mut state, &snapshot_tx, event);
                     for command in actions.runtime {
                         send_runtime_command(runtime_handle.as_ref(), command).await;
@@ -251,6 +262,7 @@ async fn run_actor(
             event = receive_platform_event(&mut platform_events) => {
                 if let Some(event) = event {
                     update_keyboard_monitor_for_platform_event(&state, &keyboard_tx, &event);
+                    record_platform_validation(&mut state, &mut monitor, &event);
                     let actions = apply_platform_event(&mut state, &snapshot_tx, event);
                     for command in actions.runtime {
                         send_runtime_command(runtime_handle.as_ref(), command).await;
@@ -299,6 +311,15 @@ async fn run_actor(
                         )
                         .await;
                     }
+                    EngineCommand::ConfigureTargetDisplay(display_id) => {
+                        if state.kvm.control == ControlState::Local {
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::SetEdgeSwitchDisplay(display_id),
+                            )
+                            .await;
+                        }
+                    }
                     EngineCommand::ConfigureListenPort(port) => {
                         send_runtime_command(
                             runtime_handle.as_ref(),
@@ -321,6 +342,14 @@ async fn run_actor(
                         .await;
                     }
                     EngineCommand::EnterControl { edge, position } => {
+                        if !windows_control_available(&state) {
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::SetInputSuppressed(false),
+                            )
+                            .await;
+                            continue;
+                        }
                         keyboard_tx.send_modify(KeyboardMonitorState::reset);
                         state.kvm.control = ControlState::EnteringRemote;
                         state.kvm.last_error = None;
@@ -375,6 +404,116 @@ async fn run_actor(
                         )
                         .await;
                     }
+                    EngineCommand::SetControlEnabled(enabled) => {
+                        let was_transitioning =
+                            state.kvm.control != ControlState::Local;
+                        state.kvm.control_enabled = enabled;
+                        if !enabled {
+                            keyboard_tx.send_modify(KeyboardMonitorState::clear_pressed);
+                            state.kvm.control = ControlState::Local;
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::SetEdgeSwitchEnabled(false),
+                            )
+                            .await;
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::SetInputSuppressed(false),
+                            )
+                            .await;
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::ReleaseAll,
+                            )
+                            .await;
+                            send_runtime_command(
+                                runtime_handle.as_ref(),
+                                RuntimeCommand::ReleaseAll,
+                            )
+                            .await;
+                            if was_transitioning {
+                                send_runtime_command(
+                                    runtime_handle.as_ref(),
+                                    RuntimeCommand::ReturnControl { position: 0.5 },
+                                )
+                                .await;
+                            }
+                        } else if windows_control_available(&state) {
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::SetEdgeSwitchEnabled(true),
+                            )
+                            .await;
+                        }
+                        publish_kvm_status(&mut state, &snapshot_tx);
+                        send_runtime_command(
+                            runtime_handle.as_ref(),
+                            RuntimeCommand::SetControlEnabled(enabled),
+                        )
+                        .await;
+                    }
+                    EngineCommand::SetGameModeEnabled(enabled) => {
+                        state.kvm.game_mode_enabled = enabled;
+                        if enabled && state.kvm.foreground_fullscreen {
+                            let was_transitioning =
+                                state.kvm.control != ControlState::Local;
+                            state.kvm.control = ControlState::Local;
+                            keyboard_tx.send_modify(KeyboardMonitorState::clear_pressed);
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::SetEdgeSwitchEnabled(false),
+                            )
+                            .await;
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::SetInputSuppressed(false),
+                            )
+                            .await;
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::ReleaseAll,
+                            )
+                            .await;
+                            send_runtime_command(
+                                runtime_handle.as_ref(),
+                                RuntimeCommand::ReleaseAll,
+                            )
+                            .await;
+                            if was_transitioning {
+                                send_runtime_command(
+                                    runtime_handle.as_ref(),
+                                    RuntimeCommand::ReturnControl { position: 0.5 },
+                                )
+                                .await;
+                            }
+                        } else if windows_control_available(&state) {
+                            send_platform_command(
+                                platform_handle.as_ref(),
+                                PlatformCommand::SetEdgeSwitchEnabled(true),
+                            )
+                            .await;
+                        }
+                        publish_kvm_status(&mut state, &snapshot_tx);
+                        send_runtime_command(
+                            runtime_handle.as_ref(),
+                            RuntimeCommand::SetGameModeEnabled(enabled),
+                        )
+                        .await;
+                    }
+                    EngineCommand::ActivateClipboardHistory(id) => {
+                        send_runtime_command(
+                            runtime_handle.as_ref(),
+                            RuntimeCommand::ActivateClipboardHistory(id),
+                        )
+                        .await;
+                    }
+                    EngineCommand::ClearClipboardHistory => {
+                        send_runtime_command(
+                            runtime_handle.as_ref(),
+                            RuntimeCommand::ClearClipboardHistory,
+                        )
+                        .await;
+                    }
                     EngineCommand::SetLocalPolicy(policy) => {
                         state.kvm.local_policy = policy;
                         if policy == LocalControlPolicy::Paused {
@@ -416,6 +555,17 @@ async fn run_actor(
                         )
                         .await;
                     }
+                    EngineCommand::RecoverConnectionNow => {
+                        tracing::info!(
+                            component = "connection",
+                            "system resumed; requesting immediate KVM recovery"
+                        );
+                        send_runtime_command(
+                            runtime_handle.as_ref(),
+                            RuntimeCommand::RecoverNow(RecoveryTrigger::SystemResumed),
+                        )
+                        .await;
+                    }
                     EngineCommand::ShutdownRequested { reply } => {
                         keyboard_tx.send_modify(KeyboardMonitorState::clear_pressed);
                         send_platform_command(
@@ -447,6 +597,86 @@ async fn run_actor(
                 }
             }
         }
+    }
+}
+
+fn record_runtime_validation(
+    state: &mut RuntimeState,
+    monitor: &mut ValidationMonitor,
+    event: &RuntimeEvent,
+) {
+    if matches!(event, RuntimeEvent::Offline { .. })
+        && state.role == EndpointRole::WindowsController
+        && state.kvm.control == ControlState::EnteringRemote
+    {
+        state.validation = monitor.record_kvm(KvmValidationEvent::TransitionFailed);
+    }
+    let validation_event = match event {
+        RuntimeEvent::EnterControlResult { accepted: true, .. }
+            if state.role == EndpointRole::WindowsController =>
+        {
+            Some(KvmValidationEvent::EnteredRemote)
+        }
+        RuntimeEvent::EnterControlResult {
+            accepted: false, ..
+        } if state.role == EndpointRole::WindowsController => {
+            Some(KvmValidationEvent::TransitionFailed)
+        }
+        RuntimeEvent::ReturnControlRequested { .. } | RuntimeEvent::ReturnControlAcknowledged
+            if state.role == EndpointRole::WindowsController =>
+        {
+            Some(KvmValidationEvent::ReturnedLocal)
+        }
+        RuntimeEvent::Offline { .. }
+            if state.role == EndpointRole::WindowsController
+                && (state.kvm.link == LinkState::Online
+                    || state.kvm.control != ControlState::Local) =>
+        {
+            Some(KvmValidationEvent::Disconnected)
+        }
+        RuntimeEvent::Online { .. } if state.role == EndpointRole::WindowsController => {
+            Some(KvmValidationEvent::Reconnected)
+        }
+        RuntimeEvent::LatencyUpdated { milliseconds }
+            if state.role == EndpointRole::WindowsController =>
+        {
+            Some(KvmValidationEvent::Latency(*milliseconds))
+        }
+        RuntimeEvent::RecoveryTriggered {
+            trigger: RecoveryTrigger::NetworkChanged,
+        } if state.role == EndpointRole::WindowsController => {
+            Some(KvmValidationEvent::NetworkRecovery)
+        }
+        RuntimeEvent::RecoveryTriggered {
+            trigger: RecoveryTrigger::SystemResumed,
+        } if state.role == EndpointRole::WindowsController => {
+            Some(KvmValidationEvent::WakeRecovery)
+        }
+        _ => None,
+    };
+    if let Some(event) = validation_event {
+        state.validation = monitor.record_kvm(event);
+    }
+}
+
+fn record_platform_validation(
+    state: &mut RuntimeState,
+    monitor: &mut ValidationMonitor,
+    event: &PlatformEvent,
+) {
+    let validation_event = match event {
+        PlatformEvent::EmergencyReturn { response_ms }
+            if state.role == EndpointRole::WindowsController =>
+        {
+            Some(KvmValidationEvent::EmergencyReturn(*response_ms))
+        }
+        PlatformEvent::AdapterFailed(_) if state.kvm.control != ControlState::Local => {
+            Some(KvmValidationEvent::TransitionFailed)
+        }
+        _ => None,
+    };
+    if let Some(event) = validation_event {
+        state.validation = monitor.record_kvm(event);
     }
 }
 
@@ -488,7 +718,7 @@ fn update_keyboard_monitor_for_platform_event(
         {
             keyboard_tx.send_modify(|monitor| monitor.observe(*usage, *action));
         }
-        PlatformEvent::EmergencyReturn | PlatformEvent::AdapterFailed(_) => {
+        PlatformEvent::EmergencyReturn { .. } | PlatformEvent::AdapterFailed(_) => {
             keyboard_tx.send_modify(KeyboardMonitorState::clear_pressed);
         }
         _ => {}
@@ -550,6 +780,11 @@ fn apply_runtime_event(
     let mut actions = EngineActions::default();
     match event {
         RuntimeEvent::TrustedPeerLoaded { peer } => {
+            tracing::info!(
+                component = "connection",
+                paired = peer.is_some(),
+                "trusted peer state loaded"
+            );
             state.kvm.trust = if peer.is_some() {
                 TrustState::Paired
             } else {
@@ -566,6 +801,65 @@ fn apply_runtime_event(
                     .push(PlatformCommand::SetInputSuppressed(false));
                 actions.platform.push(PlatformCommand::ReleaseAll);
             }
+        }
+        RuntimeEvent::ControlEnabledChanged { enabled } => {
+            state.kvm.control_enabled = enabled;
+            if !enabled {
+                state.kvm.control = ControlState::Local;
+                actions
+                    .platform
+                    .push(PlatformCommand::SetEdgeSwitchEnabled(false));
+                actions
+                    .platform
+                    .push(PlatformCommand::SetInputSuppressed(false));
+                actions.platform.push(PlatformCommand::ReleaseAll);
+            } else if windows_control_available(state) {
+                actions
+                    .platform
+                    .push(PlatformCommand::SetEdgeSwitchEnabled(true));
+            }
+        }
+        RuntimeEvent::GameModeEnabledChanged { enabled } => {
+            state.kvm.game_mode_enabled = enabled;
+            apply_windows_protection(state, &mut actions);
+        }
+        RuntimeEvent::ClipboardTransferChanged {
+            state: transfer_state,
+            error,
+            updated_at_unix_ms,
+        } => {
+            state.kvm.clipboard.transfer_state = transfer_state;
+            state.kvm.clipboard.last_error = error;
+            if updated_at_unix_ms.is_some() {
+                state.kvm.clipboard.last_updated_unix_ms = updated_at_unix_ms;
+            }
+        }
+        RuntimeEvent::ClipboardReceived(payload) => {
+            tracing::info!(
+                component = "clipboard",
+                transfer_id = %payload.id,
+                kind = ?payload.kind(),
+                inline_bytes = payload.total_inline_bytes(),
+                file_count = payload.files.len(),
+                "remote clipboard transfer completed"
+            );
+            state.kvm.clipboard.transfer_state = ClipboardTransferState::Idle;
+            state.kvm.clipboard.last_error = None;
+            state.kvm.clipboard.last_updated_unix_ms = Some(payload.captured_at_unix_ms);
+            actions
+                .platform
+                .push(PlatformCommand::ApplyClipboard(payload));
+        }
+        RuntimeEvent::ClipboardHistoryChanged(history) => {
+            state.kvm.clipboard.history = history;
+        }
+        RuntimeEvent::ClipboardHistoryActivated(payload) => {
+            state.kvm.clipboard.transfer_state = ClipboardTransferState::Sending;
+            state.kvm.clipboard.last_error = None;
+            state.kvm.clipboard.last_updated_unix_ms = Some(payload.captured_at_unix_ms);
+            actions
+                .platform
+                .push(PlatformCommand::ApplyClipboard(payload));
         }
         RuntimeEvent::ScreenEdgeChanged { edge } => {
             state.kvm.screen_edge = edge;
@@ -614,6 +908,13 @@ fn apply_runtime_event(
             attempt_id,
             endpoint,
         } => {
+            tracing::info!(
+                component = "connection",
+                attempt_id,
+                ip = %endpoint.ip,
+                port = endpoint.port,
+                "connecting to Mac endpoint"
+            );
             state.kvm.link = LinkState::Connecting;
             state.kvm.endpoint = Some(endpoint);
             state.kvm.last_error = None;
@@ -622,19 +923,22 @@ fn apply_runtime_event(
                     .platform
                     .push(PlatformCommand::SetEdgeSwitchEnabled(false));
             }
-            tracing::info!(
-                component = "connection",
-                attempt_id,
-                "connecting to Mac endpoint"
-            );
         }
         RuntimeEvent::ConnectionFailed {
             attempt_id,
             failure_count,
             message,
         } => {
+            tracing::warn!(
+                component = "connection",
+                attempt_id,
+                failure_count,
+                error = %message,
+                "connection attempt failed"
+            );
             state.kvm.link = LinkState::Backoff;
             state.kvm.control = ControlState::Local;
+            state.kvm.consecutive_failures = failure_count;
             if state.role == EndpointRole::WindowsController {
                 actions
                     .platform
@@ -651,12 +955,6 @@ fn apply_runtime_event(
                 Some(attempt_id),
                 None,
             ));
-            tracing::warn!(
-                component = "connection",
-                attempt_id,
-                failure_count,
-                "connection attempt failed"
-            );
         }
         RuntimeEvent::Pairing {
             code,
@@ -716,11 +1014,13 @@ fn apply_runtime_event(
             }
             state.kvm.session_id = Some(session_id);
             state.kvm.pairing = None;
+            state.kvm.consecutive_failures = 0;
             state.kvm.last_error = None;
             if state.role == EndpointRole::WindowsController {
-                actions
-                    .platform
-                    .push(PlatformCommand::SetEdgeSwitchEnabled(true));
+                state.kvm.remote_control_available = true;
+                actions.platform.push(PlatformCommand::SetEdgeSwitchEnabled(
+                    windows_control_available(state),
+                ));
             }
             tracing::info!(
                 component = "connection",
@@ -739,6 +1039,7 @@ fn apply_runtime_event(
                 LinkState::Idle
             };
             state.kvm.control = ControlState::Local;
+            state.kvm.remote_control_available = false;
             state.kvm.latency_ms = None;
             state.kvm.session_id = None;
             state.kvm.pairing = None;
@@ -809,8 +1110,16 @@ fn apply_runtime_event(
                 ControlState::Local
             };
             if accepted {
+                state.kvm.remote_control_available = true;
                 state.kvm.last_error = None;
             } else {
+                let remote_paused = reason.as_deref() == Some("Mac 已暂停远程控制");
+                if remote_paused {
+                    state.kvm.remote_control_available = false;
+                    actions
+                        .platform
+                        .push(PlatformCommand::SetEdgeSwitchEnabled(false));
+                }
                 state.kvm.last_error = Some(connection_error(
                     "KVM-CONTROL-001",
                     ConnectionErrorStage::Permission,
@@ -864,16 +1173,31 @@ fn apply_runtime_event(
             actions.platform.push(PlatformCommand::ReleaseAll);
         }
         RuntimeEvent::RemotePauseChanged { paused } => {
+            state.kvm.remote_control_available = !paused;
             if paused {
                 state.kvm.control = ControlState::Local;
                 actions
                     .platform
+                    .push(PlatformCommand::SetEdgeSwitchEnabled(false));
+                actions
+                    .platform
                     .push(PlatformCommand::SetInputSuppressed(false));
                 actions.platform.push(PlatformCommand::ReleaseAll);
+            } else if windows_control_available(state) {
+                state.kvm.last_error = None;
+                actions
+                    .platform
+                    .push(PlatformCommand::SetEdgeSwitchEnabled(true));
             }
         }
-        RuntimeEvent::ConfigUpdated => {}
+        RuntimeEvent::RecoveryTriggered { .. } | RuntimeEvent::ConfigUpdated => {}
         RuntimeEvent::RuntimeFailed { message } => {
+            tracing::warn!(
+                component = "connection",
+                role = ?state.role,
+                error = %message,
+                "KVM runtime operation failed"
+            );
             state.kvm.control = ControlState::Local;
             if state.role == EndpointRole::WindowsController {
                 actions
@@ -913,11 +1237,47 @@ fn apply_platform_event(
                 actions.runtime.push(RuntimeCommand::SendInput(event));
             }
         }
+        PlatformEvent::TargetDisplayChanged { display_id } => {
+            state.kvm.target_display_id = Some(display_id.clone());
+            actions
+                .runtime
+                .push(RuntimeCommand::ConfigureTargetDisplay(display_id));
+        }
+        PlatformEvent::ForegroundFullscreenChanged { active } => {
+            state.kvm.foreground_fullscreen = active;
+            apply_windows_protection(state, &mut actions);
+            tracing::info!(
+                component = "game-mode",
+                active,
+                protection_enabled = state.kvm.game_mode_enabled,
+                "Windows foreground fullscreen state changed"
+            );
+        }
+        PlatformEvent::ClipboardChanged(payload) => {
+            tracing::info!(
+                component = "clipboard",
+                transfer_id = %payload.id,
+                kind = ?payload.kind(),
+                inline_bytes = payload.total_inline_bytes(),
+                file_count = payload.files.len(),
+                "local clipboard changed"
+            );
+            state.kvm.clipboard.transfer_state = ClipboardTransferState::Sending;
+            state.kvm.clipboard.last_error = None;
+            state.kvm.clipboard.last_updated_unix_ms = Some(payload.captured_at_unix_ms);
+            actions.runtime.push(RuntimeCommand::SetClipboard(payload));
+        }
+        PlatformEvent::ClipboardFailed(message) => {
+            tracing::warn!(
+                component = "clipboard",
+                error = %message,
+                "clipboard adapter operation failed"
+            );
+            state.kvm.clipboard.transfer_state = ClipboardTransferState::Failed;
+            state.kvm.clipboard.last_error = Some(message);
+        }
         PlatformEvent::LocalEdgeReached { edge, position } => {
-            if state.role == EndpointRole::WindowsController
-                && state.kvm.link == LinkState::Online
-                && state.kvm.control == ControlState::Local
-            {
+            if windows_control_available(state) {
                 state.kvm.control = ControlState::EnteringRemote;
                 state.kvm.last_error = None;
                 actions
@@ -953,7 +1313,7 @@ fn apply_platform_event(
                 );
             }
         }
-        PlatformEvent::EmergencyReturn => {
+        PlatformEvent::EmergencyReturn { .. } => {
             state.kvm.control = ControlState::Local;
             actions
                 .platform
@@ -1026,6 +1386,44 @@ fn apply_platform_event(
         publish_kvm_status(state, snapshot_tx);
     }
     actions
+}
+
+fn windows_control_available(state: &RuntimeState) -> bool {
+    state.role == EndpointRole::WindowsController
+        && state.kvm.control_enabled
+        && !(state.kvm.game_mode_enabled && state.kvm.foreground_fullscreen)
+        && state.kvm.link == LinkState::Online
+        && state.kvm.control == ControlState::Local
+        && state.kvm.remote_control_available
+}
+
+fn apply_windows_protection(state: &mut RuntimeState, actions: &mut EngineActions) {
+    if state.role != EndpointRole::WindowsController {
+        return;
+    }
+    if windows_control_available(state) {
+        actions
+            .platform
+            .push(PlatformCommand::SetEdgeSwitchEnabled(true));
+        return;
+    }
+    let was_transitioning = state.kvm.control != ControlState::Local;
+    if state.kvm.game_mode_enabled && state.kvm.foreground_fullscreen {
+        state.kvm.control = ControlState::Local;
+    }
+    actions
+        .platform
+        .push(PlatformCommand::SetEdgeSwitchEnabled(false));
+    if was_transitioning && state.kvm.game_mode_enabled && state.kvm.foreground_fullscreen {
+        actions
+            .platform
+            .push(PlatformCommand::SetInputSuppressed(false));
+        actions.platform.push(PlatformCommand::ReleaseAll);
+        actions.runtime.push(RuntimeCommand::ReleaseAll);
+        actions
+            .runtime
+            .push(RuntimeCommand::ReturnControl { position: 0.5 });
+    }
 }
 
 fn publish_kvm_status(state: &mut RuntimeState, snapshot_tx: &watch::Sender<AppSnapshot>) {
@@ -1101,7 +1499,10 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod kvm_tests {
     use super::*;
-    use kvmflow_domain::{InputEvent, KeyAction, KeyUsage};
+    use kvmflow_domain::{
+        ClipboardContentKind, ClipboardHistoryItem, ClipboardPayload, InputEvent, KeyAction,
+        KeyUsage,
+    };
 
     fn state(role: EndpointRole) -> (RuntimeState, watch::Sender<AppSnapshot>) {
         let state = RuntimeState::new(
@@ -1155,6 +1556,108 @@ mod kvm_tests {
             command,
             PlatformCommand::SetEdgeSwitchEdge(ScreenEdge::Left)
         )));
+    }
+
+    #[test]
+    fn clipboard_history_is_published_and_reapplied_locally() {
+        let (mut state, snapshots) = state(EndpointRole::WindowsController);
+        let item = ClipboardHistoryItem {
+            id: "history-one".into(),
+            captured_at_unix_ms: 42,
+            kind: ClipboardContentKind::Text,
+            preview: "hello".into(),
+            size_bytes: 5,
+            available: true,
+        };
+
+        apply_runtime_event(
+            &mut state,
+            &snapshots,
+            RuntimeEvent::ClipboardHistoryChanged(vec![item.clone()]),
+        );
+        assert_eq!(state.kvm.clipboard.history, vec![item]);
+
+        let payload = ClipboardPayload {
+            id: "history-activated".into(),
+            captured_at_unix_ms: 84,
+            text: Some("hello".into()),
+            html: None,
+            rich_text: None,
+            image_png: None,
+            files: Vec::new(),
+        };
+        let actions = apply_runtime_event(
+            &mut state,
+            &snapshots,
+            RuntimeEvent::ClipboardHistoryActivated(payload.clone()),
+        );
+
+        assert!(actions.platform.iter().any(|command| matches!(
+            command,
+            PlatformCommand::ApplyClipboard(applied) if applied == &payload
+        )));
+        assert_eq!(
+            state.kvm.clipboard.transfer_state,
+            ClipboardTransferState::Sending
+        );
+    }
+
+    #[test]
+    fn selected_windows_display_updates_status_and_persists_actual_target() {
+        let (mut state, snapshots) = state(EndpointRole::WindowsController);
+
+        let actions = apply_platform_event(
+            &mut state,
+            &snapshots,
+            PlatformEvent::TargetDisplayChanged {
+                display_id: r"\\.\DISPLAY2".into(),
+            },
+        );
+
+        assert_eq!(
+            state.kvm.target_display_id.as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+        assert!(actions.runtime.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::ConfigureTargetDisplay(display_id)
+                if display_id == r"\\.\DISPLAY2"
+        )));
+    }
+
+    #[test]
+    fn third_connection_failure_is_exposed_until_online_recovery() {
+        let (mut state, snapshots) = state(EndpointRole::WindowsController);
+
+        apply_runtime_event(
+            &mut state,
+            &snapshots,
+            RuntimeEvent::ConnectionFailed {
+                attempt_id: 3,
+                failure_count: 3,
+                message: "connection refused".into(),
+            },
+        );
+        assert_eq!(state.kvm.consecutive_failures, 3);
+
+        apply_runtime_event(
+            &mut state,
+            &snapshots,
+            RuntimeEvent::Online {
+                session_id: "session".into(),
+                peer: kvmflow_transport::TrustedPeer {
+                    role: EndpointRole::MacEndpoint,
+                    device_id: "mac".into(),
+                    device_name: "Mac".into(),
+                    public_key: vec![0; 32],
+                },
+                endpoint: NetworkEndpoint {
+                    ip: "192.168.1.20".into(),
+                    port: 45_888,
+                },
+            },
+        );
+        assert_eq!(state.kvm.consecutive_failures, 0);
     }
 
     #[test]
@@ -1274,6 +1777,129 @@ mod kvm_tests {
                 position
             } if *position == 0.25
         )));
+    }
+
+    #[test]
+    fn disabled_windows_control_blocks_manual_and_edge_entry() {
+        let (mut state, snapshots) = state(EndpointRole::WindowsController);
+        state.kvm.link = LinkState::Online;
+        state.kvm.control_enabled = false;
+
+        let actions = apply_platform_event(
+            &mut state,
+            &snapshots,
+            PlatformEvent::LocalEdgeReached {
+                edge: ScreenEdge::Bottom,
+                position: 0.25,
+            },
+        );
+
+        assert_eq!(state.kvm.control, ControlState::Local);
+        assert!(actions.runtime.is_empty());
+        assert!(
+            !actions
+                .platform
+                .iter()
+                .any(|command| matches!(command, PlatformCommand::BeginEdgeTransition { .. }))
+        );
+    }
+
+    #[test]
+    fn foreground_fullscreen_releases_remote_control_until_it_leaves_foreground() {
+        let (mut state, snapshots) = state(EndpointRole::WindowsController);
+        state.kvm.link = LinkState::Online;
+        state.kvm.control = ControlState::Remote;
+
+        let protected = apply_platform_event(
+            &mut state,
+            &snapshots,
+            PlatformEvent::ForegroundFullscreenChanged { active: true },
+        );
+
+        assert!(state.kvm.foreground_fullscreen);
+        assert_eq!(state.kvm.control, ControlState::Local);
+        assert!(protected.runtime.iter().any(
+            |command| matches!(command, RuntimeCommand::ReturnControl { position } if *position == 0.5)
+        ));
+        assert!(
+            protected
+                .platform
+                .iter()
+                .any(|command| matches!(command, PlatformCommand::SetEdgeSwitchEnabled(false)))
+        );
+
+        let restored = apply_platform_event(
+            &mut state,
+            &snapshots,
+            PlatformEvent::ForegroundFullscreenChanged { active: false },
+        );
+
+        assert!(!state.kvm.foreground_fullscreen);
+        assert!(
+            restored
+                .platform
+                .iter()
+                .any(|command| matches!(command, PlatformCommand::SetEdgeSwitchEnabled(true)))
+        );
+    }
+
+    #[test]
+    fn remote_pause_disables_windows_edge_switch_until_resumed() {
+        let (mut state, snapshots) = state(EndpointRole::WindowsController);
+        state.kvm.link = LinkState::Online;
+
+        let paused_actions = apply_runtime_event(
+            &mut state,
+            &snapshots,
+            RuntimeEvent::RemotePauseChanged { paused: true },
+        );
+
+        assert!(!state.kvm.remote_control_available);
+        assert!(
+            paused_actions
+                .platform
+                .iter()
+                .any(|command| matches!(command, PlatformCommand::SetEdgeSwitchEnabled(false)))
+        );
+
+        let resumed_actions = apply_runtime_event(
+            &mut state,
+            &snapshots,
+            RuntimeEvent::RemotePauseChanged { paused: false },
+        );
+
+        assert!(state.kvm.remote_control_available);
+        assert!(
+            resumed_actions
+                .platform
+                .iter()
+                .any(|command| matches!(command, PlatformCommand::SetEdgeSwitchEnabled(true)))
+        );
+    }
+
+    #[test]
+    fn unavailable_remote_blocks_stale_windows_edge_events() {
+        let (mut state, snapshots) = state(EndpointRole::WindowsController);
+        state.kvm.link = LinkState::Online;
+        state.kvm.remote_control_available = false;
+
+        let actions = apply_platform_event(
+            &mut state,
+            &snapshots,
+            PlatformEvent::LocalEdgeReached {
+                edge: ScreenEdge::Bottom,
+                position: 0.5,
+            },
+        );
+
+        assert_eq!(state.kvm.control, ControlState::Local);
+        assert!(actions.runtime.is_empty());
+        assert!(
+            !actions
+                .platform
+                .iter()
+                .any(|command| matches!(command, PlatformCommand::BeginEdgeTransition { .. }))
+        );
     }
 
     #[test]
@@ -1443,7 +2069,13 @@ mod kvm_tests {
         let (mut state, snapshots) = state(EndpointRole::WindowsController);
         state.kvm.control = ControlState::Remote;
 
-        let actions = apply_platform_event(&mut state, &snapshots, PlatformEvent::EmergencyReturn);
+        let actions = apply_platform_event(
+            &mut state,
+            &snapshots,
+            PlatformEvent::EmergencyReturn {
+                response_ms: Some(0.5),
+            },
+        );
 
         assert_eq!(state.kvm.control, ControlState::Local);
         assert!(

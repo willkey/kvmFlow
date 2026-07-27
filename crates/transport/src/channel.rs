@@ -112,6 +112,10 @@ impl SecureChannel {
             envelope_reader: self.envelope_reader,
         }
     }
+
+    pub(crate) fn into_raw_parts(self) -> (TlsStream<TcpStream>, Vec<u8>) {
+        (self.stream, self.envelope_reader.into_buffered())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -84,6 +84,7 @@ impl SecureListener {
 
     pub async fn accept(&self) -> Result<(SecureChannel, SocketAddr), TransportError> {
         let (mut stream, remote_addr) = self.listener.accept().await?;
+        stream.set_nodelay(true)?;
         write_bootstrap_certificate(&mut stream, &self.certificate).await?;
         let tls_stream = self.tls_acceptor.accept(stream).await?;
         let channel = establish_server(

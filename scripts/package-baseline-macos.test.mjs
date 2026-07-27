@@ -34,16 +34,20 @@ test("macOS packaging replaces the app at a stable path and preserves runtime da
 });
 
 test("macOS packaging requires a stable signing identity", () => {
-  assert.match(signer, /KVMFLOW_MACOS_SIGNING_IDENTITY/);
-  assert.match(signer, /ad hoc signing is not allowed/);
+  assert.match(signer, /KVMFLOW_RCODESIGN_VERSION/);
+  assert.match(signer, /apple-codesign --version/);
   assert.match(signer, /designated => cdhash/);
-  assert.match(signer, /trap restore_keychain_search_list EXIT/);
-  assert.match(signer, /security list-keychains -d user -s/);
-  assert.match(signer, /codesign --verify --deep --strict/);
+  assert.match(signer, /signing-private-key\.pem/);
+  assert.match(signer, /rcodesign sign/);
+  assert.match(signer, /--pem-file/);
+  assert.match(signer, /--timestamp-url none/);
+  assert.match(signer, /rcodesign verify/);
+  assert.doesNotMatch(signer, /security/);
+  assert.doesNotMatch(signer, /keychain/i);
+  assert.match(setup, /signing-private-key\.pem/);
+  assert.match(setup, /chmod 600 "\$signing_private_key_path"/);
   assert.match(setup, /extendedKeyUsage=critical,codeSigning/);
-  assert.match(setup, /\n  -x \\\n/);
-  assert.match(setup, /set-key-partition-list/);
-  assert.match(setup, /-p codeSign/);
+  assert.doesNotMatch(setup, /security/);
+  assert.doesNotMatch(setup, /keychain/i);
   assert.match(setup, /--remove/);
-  assert.match(setup, /security remove-trusted-cert/);
 });

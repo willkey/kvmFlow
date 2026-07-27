@@ -2,7 +2,7 @@ use kvmflow_domain::{EndpointRole, InputEvent, ScreenEdge};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 
@@ -13,6 +13,44 @@ pub struct ProtocolEnvelope {
     pub session_id: String,
     pub sequence: u64,
     pub message: ProtocolMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardOffer {
+    pub transfer_id: String,
+    pub captured_at_unix_ms: u64,
+    pub reset: bool,
+    pub manifest_complete: bool,
+    pub streams: Vec<ClipboardStream>,
+    pub directories: Vec<String>,
+    pub clipboard_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardStream {
+    pub id: u32,
+    pub kind: ClipboardStreamKind,
+    pub relative_path: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClipboardStreamKind {
+    Text,
+    Html,
+    RichText,
+    ImagePng,
+    File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChannelPurpose {
+    Control,
+    Clipboard,
 }
 
 impl ProtocolEnvelope {
@@ -32,6 +70,10 @@ pub struct EnvelopeReader {
 }
 
 impl EnvelopeReader {
+    pub fn into_buffered(self) -> Vec<u8> {
+        self.buffered
+    }
+
     pub async fn read_from<R>(&mut self, reader: &mut R) -> Result<ProtocolEnvelope, ProtocolError>
     where
         R: AsyncRead + Unpin,
@@ -92,6 +134,13 @@ pub enum ProtocolMessage {
         remote_confirmed: bool,
     },
     SessionReady,
+    OpenChannel {
+        purpose: ChannelPurpose,
+        control_session_id: Option<String>,
+    },
+    ChannelReady {
+        purpose: ChannelPurpose,
+    },
     Heartbeat {
         sent_at_unix_ms: u64,
     },
@@ -264,5 +313,30 @@ mod tests {
             expected
         );
         sender.await.expect("join sender");
+    }
+
+    #[tokio::test]
+    async fn stateful_reader_preserves_bytes_after_the_envelope() {
+        let expected = ProtocolEnvelope::new(
+            "session-1",
+            1,
+            ProtocolMessage::ChannelReady {
+                purpose: ChannelPurpose::Clipboard,
+            },
+        );
+        let payload = serde_json::to_vec(&expected).expect("serialize fixture");
+        let trailing = [0_u8, 0, 0, 3, 1, 2, 3];
+        let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&trailing);
+        let (mut writer, mut stream) = tokio::io::duplex(bytes.len());
+        writer.write_all(&bytes).await.expect("write combined data");
+
+        let mut reader = EnvelopeReader::default();
+        assert_eq!(
+            reader.read_from(&mut stream).await.expect("read envelope"),
+            expected
+        );
+        assert_eq!(reader.into_buffered(), trailing);
     }
 }

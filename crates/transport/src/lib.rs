@@ -2,6 +2,7 @@
 
 //! TLS transport, long-term device identities, pairing, and trusted sessions.
 
+mod bulk;
 mod channel;
 mod config;
 mod identity;
@@ -16,7 +17,9 @@ pub use config::{
 pub use identity::{DeviceIdentity, IdentityError, TrustedPeer};
 pub use identity_store::{IDENTITY_FILE_NAME, IdentityStoreError, load_or_create_identity};
 pub use runtime::{
-    RuntimeBridge, RuntimeCommand, RuntimeEvent, RuntimeHandle, spawn_macos_runtime,
-    spawn_windows_runtime,
+    RecoveryTrigger, RuntimeBridge, RuntimeCommand, RuntimeEvent, RuntimeHandle,
+    spawn_macos_runtime, spawn_windows_runtime,
 };
 pub use tls::{SecureListener, TransportError, connect};
+mod clipboard_history;
+mod clipboard_transfer;

@@ -1,9 +1,9 @@
+use kvmflow_domain::{DisplayTarget, KeyUsage, ScreenEdge};
 #[cfg(windows)]
 use kvmflow_domain::{InputEvent, KeyAction, MouseButton};
-use kvmflow_domain::{KeyUsage, ScreenEdge};
 use kvmflow_platform_api::PlatformBridge;
 #[cfg(windows)]
-use kvmflow_platform_api::{PlatformCommand, platform_bridge};
+use kvmflow_platform_api::{ClipboardAdapter, PlatformCommand, PlatformEvent, platform_bridge};
 
 #[cfg(windows)]
 const PLATFORM_CHANNEL_CAPACITY: usize = 2048;
@@ -49,6 +49,60 @@ const VK_LCONTROL: u16 = 0xa2;
 const VK_RCONTROL: u16 = 0xa3;
 const VK_LMENU: u16 = 0xa4;
 const VK_RMENU: u16 = 0xa5;
+
+#[cfg(any(windows, test))]
+fn rect_covers_monitor(window: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32)) -> bool {
+    const TOLERANCE_PX: i32 = 2;
+    window.0 <= monitor.0 + TOLERANCE_PX
+        && window.1 <= monitor.1 + TOLERANCE_PX
+        && window.2 >= monitor.2 - TOLERANCE_PX
+        && window.3 >= monitor.3 - TOLERANCE_PX
+}
+
+#[cfg(any(windows, test))]
+fn update_remote_pressed_keys(
+    pressed: &mut std::collections::HashSet<KeyUsage>,
+    usage: KeyUsage,
+    down: bool,
+) -> RemoteKeyTransition {
+    if down {
+        if pressed.insert(usage) {
+            RemoteKeyTransition::Forward
+        } else if is_modifier_usage(usage) || usage == KeyUsage::CAPS_LOCK {
+            RemoteKeyTransition::IgnoreRepeat
+        } else {
+            RemoteKeyTransition::ForwardRepeat
+        }
+    } else if pressed.remove(&usage) {
+        RemoteKeyTransition::Forward
+    } else {
+        RemoteKeyTransition::IgnoreRelease
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteKeyTransition {
+    Forward,
+    ForwardRepeat,
+    IgnoreRepeat,
+    IgnoreRelease,
+}
+
+#[cfg(any(windows, test))]
+fn is_modifier_usage(usage: KeyUsage) -> bool {
+    matches!(
+        usage,
+        KeyUsage::LEFT_CONTROL
+            | KeyUsage::RIGHT_CONTROL
+            | KeyUsage::LEFT_SHIFT
+            | KeyUsage::RIGHT_SHIFT
+            | KeyUsage::LEFT_ALT
+            | KeyUsage::RIGHT_ALT
+            | KeyUsage::LEFT_GUI
+            | KeyUsage::RIGHT_GUI
+    )
+}
 
 #[cfg(any(windows, test))]
 #[derive(Default)]
@@ -176,6 +230,7 @@ struct EdgeTrigger {
 struct EdgeDetector {
     edge: ScreenEdge,
     enabled: bool,
+    blocked: bool,
     latched: bool,
 }
 
@@ -185,6 +240,7 @@ impl EdgeDetector {
         Self {
             edge,
             enabled: false,
+            blocked: false,
             latched: false,
         }
     }
@@ -201,6 +257,18 @@ impl EdgeDetector {
         self.latched = false;
     }
 
+    fn set_blocked(&mut self, blocked: bool) {
+        self.blocked = blocked;
+        if blocked {
+            self.latched = false;
+        }
+    }
+
+    #[cfg(windows)]
+    fn rearm(&mut self) {
+        self.latched = false;
+    }
+
     fn observe(
         &mut self,
         bounds: ScreenBounds,
@@ -208,7 +276,7 @@ impl EdgeDetector {
         y: i32,
         button_held: bool,
     ) -> Option<EdgeTrigger> {
-        if !self.enabled || !bounds.contains_edge_position(self.edge, x, y) {
+        if !self.enabled || self.blocked || !bounds.contains_edge_position(self.edge, x, y) {
             return None;
         }
         if self.latched {
@@ -226,6 +294,28 @@ impl EdgeDetector {
             position: bounds.normalized_position(self.edge, x, y),
         })
     }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsDisplay {
+    target: DisplayTarget,
+    bounds: ScreenBounds,
+}
+
+#[cfg(any(windows, test))]
+fn select_display<'a>(
+    displays: &'a [WindowsDisplay],
+    preferred_id: Option<&str>,
+) -> Option<&'a WindowsDisplay> {
+    preferred_id
+        .and_then(|preferred_id| {
+            displays
+                .iter()
+                .find(|display| display.target.id == preferred_id)
+        })
+        .or_else(|| displays.iter().find(|display| display.target.primary))
+        .or_else(|| displays.first())
 }
 
 #[cfg(windows)]
@@ -293,14 +383,62 @@ fn virtual_key_to_remote_usage_with_extended(virtual_key: u16, extended: bool) -
     Some(KeyUsage(usage))
 }
 
+#[cfg(any(windows, test))]
+fn normalize_windows_virtual_key(virtual_key: u16, scan_code: u16, extended: bool) -> u16 {
+    match virtual_key {
+        VK_SHIFT if scan_code == 0x36 => VK_RSHIFT,
+        VK_SHIFT => VK_LSHIFT,
+        VK_CONTROL if extended => VK_RCONTROL,
+        VK_CONTROL => VK_LCONTROL,
+        VK_MENU if extended => VK_RMENU,
+        VK_MENU => VK_LMENU,
+        _ => virtual_key,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn keyboard_semantic_name(usage: KeyUsage) -> Option<&'static str> {
+    match usage {
+        KeyUsage::ENTER => Some("enter"),
+        KeyUsage::BACKSPACE => Some("backspace"),
+        KeyUsage::HOME => Some("home"),
+        KeyUsage::PAGE_UP => Some("page_up"),
+        KeyUsage::FORWARD_DELETE => Some("forward_delete"),
+        KeyUsage::END => Some("end"),
+        KeyUsage::PAGE_DOWN => Some("page_down"),
+        KeyUsage::RIGHT_ARROW => Some("arrow_right"),
+        KeyUsage::LEFT_ARROW => Some("arrow_left"),
+        KeyUsage::DOWN_ARROW => Some("arrow_down"),
+        KeyUsage::UP_ARROW => Some("arrow_up"),
+        KeyUsage::LEFT_CONTROL => Some("control_left"),
+        KeyUsage::RIGHT_CONTROL => Some("control_right"),
+        KeyUsage::LEFT_SHIFT => Some("shift_left"),
+        KeyUsage::RIGHT_SHIFT => Some("shift_right"),
+        KeyUsage::LEFT_ALT => Some("option_left"),
+        KeyUsage::RIGHT_ALT => Some("option_right"),
+        KeyUsage::LEFT_GUI => Some("command_left"),
+        KeyUsage::RIGHT_GUI => Some("command_right"),
+        KeyUsage::CAPS_LOCK => Some("caps_lock"),
+        _ => None,
+    }
+}
+
 #[cfg(windows)]
 pub fn spawn_windows_platform_adapter(
     edge: ScreenEdge,
+    target_display_id: Option<String>,
 ) -> Result<PlatformBridge, WindowsInputAdapterError> {
     let (mut driver, bridge) = platform_bridge(PLATFORM_CHANNEL_CAPACITY);
-    let control = Win32HookControl::start(driver.events.clone(), edge)?;
+    let control = Win32HookControl::start(driver.events.clone(), edge, target_display_id)?;
+    let clipboard = ClipboardAdapter::start(driver.events.clone()).map_err(|error| {
+        let _ = driver
+            .events
+            .try_send(PlatformEvent::ClipboardFailed(error.to_string()));
+        error
+    });
     tokio::spawn(async move {
         let mut control = control;
+        let clipboard = clipboard.ok();
         while let Some(command) = driver.commands.recv().await {
             match command {
                 PlatformCommand::SetInputSuppressed(suppressed) => {
@@ -312,11 +450,24 @@ pub fn spawn_windows_platform_adapter(
                 PlatformCommand::SetEdgeSwitchEdge(edge) => {
                     control.set_edge_switch_edge(edge);
                 }
+                PlatformCommand::SetEdgeSwitchDisplay(display_id) => {
+                    control.set_edge_switch_display(&display_id);
+                }
                 PlatformCommand::BeginEdgeTransition { edge, position } => {
                     control.begin_edge_transition(edge, position);
                 }
                 PlatformCommand::RestoreLocalPointer { position } => {
                     control.restore_local_pointer(position);
+                }
+                PlatformCommand::ApplyClipboard(payload) => {
+                    if let Some(clipboard) = clipboard.as_ref()
+                        && let Err(error) = clipboard.apply(payload)
+                    {
+                        let _ = driver
+                            .events
+                            .send(PlatformEvent::ClipboardFailed(error.to_string()))
+                            .await;
+                    }
                 }
                 PlatformCommand::Shutdown => {
                     control.set_suppressed(false);
@@ -337,14 +488,25 @@ pub fn spawn_windows_platform_adapter(
 #[cfg(not(windows))]
 pub fn spawn_windows_platform_adapter(
     _edge: ScreenEdge,
+    _target_display_id: Option<String>,
 ) -> Result<PlatformBridge, WindowsInputAdapterError> {
+    Err(WindowsInputAdapterError::Unavailable)
+}
+
+#[cfg(windows)]
+pub fn available_windows_displays() -> Result<Vec<DisplayTarget>, WindowsInputAdapterError> {
+    win32::available_displays()
+}
+
+#[cfg(not(windows))]
+pub fn available_windows_displays() -> Result<Vec<DisplayTarget>, WindowsInputAdapterError> {
     Err(WindowsInputAdapterError::Unavailable)
 }
 
 #[cfg(windows)]
 mod win32 {
     use std::{
-        collections::HashSet,
+        collections::{HashSet, VecDeque},
         ptr,
         sync::{
             Arc, Mutex, OnceLock,
@@ -357,39 +519,117 @@ mod win32 {
     use kvmflow_platform_api::PlatformEvent;
     use tokio::sync::mpsc::Sender;
     use windows_sys::Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Graphics::Gdi::{
+            EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
+            MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+        },
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{
+            Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             Input::{
                 GetRawInputData, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
                 RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE,
-                RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RegisterRawInputDevices,
+                RIM_TYPEMOUSE, RegisterRawInputDevices,
             },
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                GetMessageW, GetSystemMetrics, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-                PostThreadMessageW, RI_KEY_BREAK, RI_KEY_E0, RegisterClassW, SM_CXSCREEN,
-                SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SetCursorPos,
+                EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, GetDesktopWindow,
+                GetForegroundWindow, GetMessageW, GetShellWindow, GetSystemMetrics, GetWindowRect,
+                HWND_MESSAGE, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+                MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW,
+                SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SetCursorPos,
                 SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW,
-                WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-                WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-                WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+                WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_DISPLAYCHANGE, WM_INPUT,
+                WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+                WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
             },
         },
     };
 
     use super::{
-        ActiveEdgeTransition, EdgeDetector, InputEvent, KeyAction, MouseButton, RawPointerState,
-        ScreenBounds, ScreenEdge, VK_CONTROL, VK_F12, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
-        VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT, WindowsInputAdapterError,
-        virtual_key_to_remote_usage_with_extended,
+        ActiveEdgeTransition, DisplayTarget, EdgeDetector, InputEvent, KeyAction, MouseButton,
+        RawPointerState, RemoteKeyTransition, ScreenBounds, ScreenEdge, VK_CONTROL, VK_F12,
+        VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+        WindowsDisplay, WindowsInputAdapterError, is_modifier_usage, keyboard_semantic_name,
+        normalize_windows_virtual_key, rect_covers_monitor, select_display,
+        update_remote_pressed_keys, virtual_key_to_remote_usage_with_extended,
     };
 
     const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
     const HID_USAGE_GENERIC_MOUSE: u16 = 0x02;
-    const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
     const EMERGENCY_EDGE_COOLDOWN: Duration = Duration::from_secs(3);
+    const PENDING_KEY_EVENT_LIMIT: usize = 64;
+    const WM_REARM_LOW_LEVEL_HOOKS: u32 = 0x8001;
+
+    pub(super) fn available_displays() -> Result<Vec<DisplayTarget>, WindowsInputAdapterError> {
+        enumerate_displays()
+            .map(|displays| displays.into_iter().map(|display| display.target).collect())
+    }
+
+    fn enumerate_displays() -> Result<Vec<WindowsDisplay>, WindowsInputAdapterError> {
+        let mut displays: Vec<WindowsDisplay> = Vec::new();
+        let result = unsafe {
+            EnumDisplayMonitors(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                Some(collect_display),
+                &mut displays as *mut Vec<WindowsDisplay> as LPARAM,
+            )
+        };
+        if result == 0 || displays.is_empty() {
+            return Err(WindowsInputAdapterError::DisplayEnumerationFailed);
+        }
+        displays.sort_by(|left, right| {
+            right
+                .target
+                .primary
+                .cmp(&left.target.primary)
+                .then_with(|| left.target.id.cmp(&right.target.id))
+        });
+        Ok(displays)
+    }
+
+    unsafe extern "system" fn collect_display(
+        monitor: HMONITOR,
+        _device_context: HDC,
+        _monitor_rect: *mut RECT,
+        data: LPARAM,
+    ) -> i32 {
+        let displays = unsafe { &mut *(data as *mut Vec<WindowsDisplay>) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo as *mut MONITORINFO) } == 0 {
+            return 1;
+        }
+        let device_name_length = info
+            .szDevice
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(info.szDevice.len());
+        let id = String::from_utf16_lossy(&info.szDevice[..device_name_length]);
+        let rect = info.monitorInfo.rcMonitor;
+        let width = (rect.right - rect.left).max(1) as u32;
+        let height = (rect.bottom - rect.top).max(1) as u32;
+        displays.push(WindowsDisplay {
+            target: DisplayTarget {
+                id,
+                primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+                left: rect.left,
+                top: rect.top,
+                width,
+                height,
+            },
+            bounds: ScreenBounds {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right - 1,
+                bottom: rect.bottom - 1,
+            },
+        });
+        1
+    }
 
     pub(super) struct Win32HookControl {
         thread_id: u32,
@@ -402,6 +642,7 @@ mod win32 {
         pub(super) fn start(
             events: Sender<PlatformEvent>,
             edge: ScreenEdge,
+            target_display_id: Option<String>,
         ) -> Result<Self, WindowsInputAdapterError> {
             let (startup_tx, startup_rx) = mpsc::channel();
             let (completion_tx, completion_rx) = mpsc::channel();
@@ -410,7 +651,13 @@ mod win32 {
             let join = std::thread::Builder::new()
                 .name("kvmflow-win32-input".into())
                 .spawn(move || {
-                    run_hook_thread(events, thread_suppressed, edge, startup_tx);
+                    run_hook_thread(
+                        events,
+                        thread_suppressed,
+                        edge,
+                        target_display_id,
+                        startup_tx,
+                    );
                     let _ = completion_tx.send(());
                 })
                 .map_err(|_| WindowsInputAdapterError::StartFailed)?;
@@ -432,16 +679,22 @@ mod win32 {
                 && let Some(state) = state.as_mut()
             {
                 if suppressed && !was_suppressed {
-                    state.stats = CaptureSessionStats::default();
-                    state.remote_pressed_keys.clear();
-                    state.raw_keyboard_observed = false;
-                    state.remote_started_at = Some(Instant::now());
+                    if !state.transition_pending {
+                        state.start_keyboard_capture();
+                    }
+                    tracing::info!(
+                        component = "input",
+                        stage = "windows_capture",
+                        capture_source = "low_level_hook",
+                        "Windows remote input capture armed"
+                    );
                 } else if !suppressed && state.remote_active {
                     state.stats.log_and_reset("control_ended");
                 }
                 if suppressed {
                     state.remote_active = true;
                     state.transition_pending = false;
+                    state.flush_pending_keyboard_events();
                 } else {
                     if state.remote_active {
                         restore_point = state.active_transition.map(|transition| {
@@ -459,6 +712,7 @@ mod win32 {
                 if !suppressed {
                     state.pressed_keys.clear();
                     state.remote_pressed_keys.clear();
+                    state.pending_key_events.clear();
                     state.remote_started_at = None;
                 }
             }
@@ -473,7 +727,7 @@ mod win32 {
             if let Ok(mut state) = hook_state().lock()
                 && let Some(state) = state.as_mut()
             {
-                state.screen_bounds = primary_screen_bounds();
+                state.refresh_target_display();
                 state.edge_detector.set_enabled(enabled);
                 if !enabled && !state.remote_active {
                     state.transition_pending = false;
@@ -487,18 +741,34 @@ mod win32 {
                 && let Some(state) = state.as_mut()
             {
                 state.edge_detector.set_edge(edge);
+                state.refresh_target_display();
+            }
+        }
+
+        pub(super) fn set_edge_switch_display(&mut self, display_id: &str) {
+            if let Ok(mut state) = hook_state().lock()
+                && let Some(state) = state.as_mut()
+            {
+                state.select_target_display(Some(display_id));
             }
         }
 
         pub(super) fn begin_edge_transition(&mut self, edge: ScreenEdge, position: f32) {
+            unsafe {
+                PostThreadMessageW(self.thread_id, WM_REARM_LOW_LEVEL_HOOKS, 0, 0);
+            }
             if let Ok(mut state) = hook_state().lock()
                 && let Some(state) = state.as_mut()
             {
-                state.transition_pending = true;
+                if !state.transition_pending {
+                    state.start_keyboard_capture();
+                    state.transition_pending = true;
+                }
                 state.active_transition = Some(ActiveEdgeTransition {
                     edge,
                     return_position: position.clamp(0.0, 1.0),
                 });
+                state.prepend_held_modifier_events();
             }
         }
 
@@ -531,9 +801,11 @@ mod win32 {
         suppressed: Arc<AtomicBool>,
         pressed_keys: HashSet<u16>,
         remote_pressed_keys: HashSet<kvmflow_domain::KeyUsage>,
+        pending_key_events: VecDeque<InputEvent>,
         raw_pointer: RawPointerState,
         raw_input_observed: bool,
-        raw_keyboard_observed: bool,
+        keyboard_hook_observed: bool,
+        target_display_id: String,
         screen_bounds: ScreenBounds,
         edge_detector: EdgeDetector,
         transition_pending: bool,
@@ -543,6 +815,108 @@ mod win32 {
         edge_switch_cooldown_until: Option<Instant>,
         stats: CaptureSessionStats,
         remote_started_at: Option<Instant>,
+        foreground_fullscreen: bool,
+    }
+
+    impl HookState {
+        fn start_keyboard_capture(&mut self) {
+            self.stats = CaptureSessionStats::default();
+            self.remote_pressed_keys.clear();
+            self.pending_key_events.clear();
+            self.keyboard_hook_observed = false;
+            self.remote_started_at = Some(Instant::now());
+        }
+
+        fn prepend_held_modifier_events(&mut self) {
+            let mut held_modifiers: Vec<_> = self
+                .pressed_keys
+                .iter()
+                .filter_map(|virtual_key| {
+                    virtual_key_to_remote_usage_with_extended(*virtual_key, false)
+                })
+                .filter(|usage| is_modifier_usage(*usage))
+                .filter(|usage| !self.remote_pressed_keys.contains(usage))
+                .collect();
+            held_modifiers.sort_by_key(|usage| usage.0);
+            for usage in held_modifiers.into_iter().rev() {
+                self.remote_pressed_keys.insert(usage);
+                self.pending_key_events.push_front(InputEvent::Key {
+                    usage,
+                    action: KeyAction::Down,
+                });
+            }
+        }
+
+        fn queue_pending_key_event(&mut self, event: InputEvent) {
+            if self.pending_key_events.len() >= PENDING_KEY_EVENT_LIMIT {
+                self.stats.reliable_queue_failures =
+                    self.stats.reliable_queue_failures.saturating_add(1);
+                self.suppressed.store(false, Ordering::SeqCst);
+                self.transition_pending = false;
+                self.pending_key_events.clear();
+                self.remote_pressed_keys.clear();
+                let _ = self
+                    .events
+                    .try_send(PlatformEvent::EmergencyReturn { response_ms: None });
+                return;
+            }
+            self.pending_key_events.push_back(event);
+        }
+
+        fn flush_pending_keyboard_events(&mut self) {
+            while let Some(event) = self.pending_key_events.pop_front() {
+                send_input(self, event, true);
+                if !self.suppressed.load(Ordering::SeqCst) {
+                    self.pending_key_events.clear();
+                    self.remote_pressed_keys.clear();
+                    break;
+                }
+            }
+        }
+
+        fn select_target_display(&mut self, preferred_id: Option<&str>) {
+            let Ok(displays) = enumerate_displays() else {
+                tracing::warn!(component = "display", "failed to refresh Windows displays");
+                return;
+            };
+            let Some(display) = select_display(&displays, preferred_id) else {
+                tracing::warn!(component = "display", "Windows reported no active displays");
+                return;
+            };
+            if preferred_id.is_some_and(|preferred| preferred != display.target.id) {
+                let fallback_display = &display.target.id;
+                tracing::warn!(
+                    component = "display",
+                    requested_display = preferred_id,
+                    fallback_display = %fallback_display,
+                    "requested Windows display is unavailable; using fallback"
+                );
+            }
+            self.target_display_id.clone_from(&display.target.id);
+            self.screen_bounds = display.bounds;
+            let edge_blocked = display.target.edge_is_occupied(
+                self.edge_detector.edge,
+                displays.iter().map(|display| &display.target),
+            );
+            self.edge_detector.set_blocked(edge_blocked);
+            self.edge_detector.rearm();
+            let refreshed_display_id = display.target.id.as_str();
+            tracing::info!(
+                component = "display",
+                display_id = %refreshed_display_id,
+                edge = ?self.edge_detector.edge,
+                edge_blocked,
+                "Windows target display refreshed"
+            );
+            let _ = self.events.try_send(PlatformEvent::TargetDisplayChanged {
+                display_id: display.target.id.clone(),
+            });
+        }
+
+        fn refresh_target_display(&mut self) {
+            let target_display_id = self.target_display_id.clone();
+            self.select_target_display(Some(&target_display_id));
+        }
     }
 
     #[derive(Debug, Default)]
@@ -551,6 +925,7 @@ mod win32 {
         key_up_events: u64,
         modifier_down_events: u64,
         modifier_up_events: u64,
+        editing_key_down_events: u64,
         repeated_key_down_events: u64,
         ignored_key_up_events: u64,
         unsupported_key_events: u64,
@@ -568,6 +943,12 @@ mod win32 {
                 self.key_down_events = self.key_down_events.saturating_add(1);
                 if is_modifier_usage(usage) {
                     self.modifier_down_events = self.modifier_down_events.saturating_add(1);
+                }
+                if matches!(
+                    usage,
+                    kvmflow_domain::KeyUsage::BACKSPACE | kvmflow_domain::KeyUsage::FORWARD_DELETE
+                ) {
+                    self.editing_key_down_events = self.editing_key_down_events.saturating_add(1);
                 }
             } else {
                 self.key_up_events = self.key_up_events.saturating_add(1);
@@ -611,6 +992,7 @@ mod win32 {
                 key_up_events = self.key_up_events,
                 modifier_down_events = self.modifier_down_events,
                 modifier_up_events = self.modifier_up_events,
+                editing_key_down_events = self.editing_key_down_events,
                 repeated_key_down_events = self.repeated_key_down_events,
                 ignored_key_up_events = self.ignored_key_up_events,
                 unsupported_key_events = self.unsupported_key_events,
@@ -635,21 +1017,49 @@ mod win32 {
         events: Sender<PlatformEvent>,
         suppressed: Arc<AtomicBool>,
         edge: ScreenEdge,
+        target_display_id: Option<String>,
         startup: mpsc::Sender<Result<u32, WindowsInputAdapterError>>,
     ) {
         let mut message: MSG = unsafe { std::mem::zeroed() };
         let thread_id = unsafe { GetCurrentThreadId() };
+        let displays = match enumerate_displays() {
+            Ok(displays) => displays,
+            Err(error) => {
+                let _ = startup.send(Err(error));
+                return;
+            }
+        };
+        let Some(target_display) = select_display(&displays, target_display_id.as_deref()) else {
+            let _ = startup.send(Err(WindowsInputAdapterError::DisplayEnumerationFailed));
+            return;
+        };
+        let selected_display_id = target_display.target.id.clone();
+        let selected_bounds = target_display.bounds;
+        let selected_edge_blocked = target_display
+            .target
+            .edge_is_occupied(edge, displays.iter().map(|display| &display.target));
+        tracing::info!(
+            component = "display",
+            display_id = %selected_display_id,
+            edge = ?edge,
+            edge_blocked = selected_edge_blocked,
+            "Windows target display initialized"
+        );
+        let mut edge_detector = EdgeDetector::new(edge);
+        edge_detector.set_blocked(selected_edge_blocked);
         if let Ok(mut state) = hook_state().lock() {
             *state = Some(HookState {
-                events,
+                events: events.clone(),
                 suppressed,
                 pressed_keys: HashSet::new(),
                 remote_pressed_keys: HashSet::new(),
+                pending_key_events: VecDeque::new(),
                 raw_pointer: RawPointerState::default(),
                 raw_input_observed: false,
-                raw_keyboard_observed: false,
-                screen_bounds: primary_screen_bounds(),
-                edge_detector: EdgeDetector::new(edge),
+                keyboard_hook_observed: false,
+                target_display_id: selected_display_id.clone(),
+                screen_bounds: selected_bounds,
+                edge_detector,
                 transition_pending: false,
                 active_transition: None,
                 remote_active: false,
@@ -657,11 +1067,15 @@ mod win32 {
                 edge_switch_cooldown_until: None,
                 stats: CaptureSessionStats::default(),
                 remote_started_at: None,
+                foreground_fullscreen: false,
             });
         } else {
             let _ = startup.send(Err(WindowsInputAdapterError::StartFailed));
             return;
         }
+        let _ = events.try_send(PlatformEvent::TargetDisplayChanged {
+            display_id: selected_display_id,
+        });
         let raw_input_window = match RawInputWindow::create() {
             Ok(window) => window,
             Err(error) => {
@@ -670,14 +1084,15 @@ mod win32 {
                 return;
             }
         };
-        let keyboard =
+        let mut keyboard =
             unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), ptr::null_mut(), 0) };
         if keyboard.is_null() {
             clear_hook_state();
             let _ = startup.send(Err(WindowsInputAdapterError::InstallFailed));
             return;
         }
-        let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), ptr::null_mut(), 0) };
+        let mut mouse =
+            unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), ptr::null_mut(), 0) };
         if mouse.is_null() {
             unsafe {
                 UnhookWindowsHookEx(keyboard);
@@ -686,11 +1101,83 @@ mod win32 {
             let _ = startup.send(Err(WindowsInputAdapterError::InstallFailed));
             return;
         }
+        let foreground_hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                ptr::null_mut(),
+                Some(foreground_window_hook),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+        };
+        let location_hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                ptr::null_mut(),
+                Some(foreground_window_hook),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+        };
+        if foreground_hook.is_null() || location_hook.is_null() {
+            tracing::warn!(
+                component = "game-mode",
+                "Windows foreground fullscreen event hook could not be fully installed"
+            );
+        }
+        refresh_foreground_fullscreen(unsafe { GetForegroundWindow() });
+        tracing::info!(
+            component = "input",
+            keyboard_capture = "low_level_hook",
+            mouse_buttons = "low_level_hook",
+            mouse_movement = "raw_input_sink",
+            "Windows input hooks installed"
+        );
         let _ = startup.send(Ok(thread_id));
         loop {
             let result = unsafe { GetMessageW(&mut message, ptr::null_mut(), 0, 0) };
             if result <= 0 {
                 break;
+            }
+            if message.message == WM_REARM_LOW_LEVEL_HOOKS {
+                let replacement_keyboard = unsafe {
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), ptr::null_mut(), 0)
+                };
+                let replacement_mouse =
+                    unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), ptr::null_mut(), 0) };
+                if replacement_keyboard.is_null() || replacement_mouse.is_null() {
+                    if !replacement_keyboard.is_null() {
+                        unsafe {
+                            UnhookWindowsHookEx(replacement_keyboard);
+                        }
+                    }
+                    if !replacement_mouse.is_null() {
+                        unsafe {
+                            UnhookWindowsHookEx(replacement_mouse);
+                        }
+                    }
+                    tracing::warn!(
+                        component = "input",
+                        "Windows input hooks could not be rearmed"
+                    );
+                } else {
+                    unsafe {
+                        UnhookWindowsHookEx(keyboard);
+                        UnhookWindowsHookEx(mouse);
+                    }
+                    keyboard = replacement_keyboard;
+                    mouse = replacement_mouse;
+                    tracing::info!(
+                        component = "input",
+                        reason = "control_transition",
+                        "Windows input hooks rearmed"
+                    );
+                }
+                continue;
             }
             unsafe {
                 TranslateMessage(&message);
@@ -700,6 +1187,12 @@ mod win32 {
         unsafe {
             UnhookWindowsHookEx(keyboard);
             UnhookWindowsHookEx(mouse);
+            if !foreground_hook.is_null() {
+                UnhookWinEvent(foreground_hook);
+            }
+            if !location_hook.is_null() {
+                UnhookWinEvent(location_hook);
+            }
         }
         drop(raw_input_window);
         clear_hook_state();
@@ -748,13 +1241,9 @@ mod win32 {
                 }
                 return Err(WindowsInputAdapterError::RawInputWindowFailed);
             }
-            let devices = raw_input_devices(RIDEV_INPUTSINK, hwnd);
+            let device = raw_input_mouse_device(RIDEV_INPUTSINK, hwnd);
             if unsafe {
-                RegisterRawInputDevices(
-                    devices.as_ptr(),
-                    devices.len() as u32,
-                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-                )
+                RegisterRawInputDevices(&device, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
             } == 0
             {
                 unsafe {
@@ -769,13 +1258,9 @@ mod win32 {
 
     impl Drop for RawInputWindow {
         fn drop(&mut self) {
-            let devices = raw_input_devices(RIDEV_REMOVE, ptr::null_mut());
+            let device = raw_input_mouse_device(RIDEV_REMOVE, ptr::null_mut());
             unsafe {
-                RegisterRawInputDevices(
-                    devices.as_ptr(),
-                    devices.len() as u32,
-                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-                );
+                RegisterRawInputDevices(&device, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
                 DestroyWindow(self.hwnd);
                 UnregisterClassW(raw_input_window_class().as_ptr(), self.instance);
             }
@@ -787,21 +1272,13 @@ mod win32 {
         CLASS_NAME.get_or_init(|| "kvmFlowRawInputWindow\0".encode_utf16().collect())
     }
 
-    fn raw_input_devices(flags: u32, hwnd: HWND) -> [RAWINPUTDEVICE; 2] {
-        [
-            RAWINPUTDEVICE {
-                usUsagePage: HID_USAGE_PAGE_GENERIC,
-                usUsage: HID_USAGE_GENERIC_MOUSE,
-                dwFlags: flags,
-                hwndTarget: hwnd,
-            },
-            RAWINPUTDEVICE {
-                usUsagePage: HID_USAGE_PAGE_GENERIC,
-                usUsage: HID_USAGE_GENERIC_KEYBOARD,
-                dwFlags: flags,
-                hwndTarget: hwnd,
-            },
-        ]
+    fn raw_input_mouse_device(flags: u32, hwnd: HWND) -> RAWINPUTDEVICE {
+        RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_GENERIC,
+            usUsage: HID_USAGE_GENERIC_MOUSE,
+            dwFlags: flags,
+            hwndTarget: hwnd,
+        }
     }
 
     unsafe extern "system" fn raw_input_window_proc(
@@ -810,12 +1287,16 @@ mod win32 {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        if message == WM_INPUT {
-            process_raw_input(lparam);
-            unsafe {
-                DefWindowProcW(hwnd, message, wparam, lparam);
+        match message {
+            WM_INPUT => {
+                process_raw_input(lparam);
+                unsafe {
+                    DefWindowProcW(hwnd, message, wparam, lparam);
+                }
+                return 0;
             }
-            return 0;
+            WM_DISPLAYCHANGE => refresh_display_topology(),
+            _ => {}
         }
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
     }
@@ -838,41 +1319,30 @@ mod win32 {
         if result == u32::MAX || result == 0 {
             return;
         }
-        match input.header.dwType {
-            RIM_TYPEMOUSE => {
-                let mouse = unsafe { input.data.mouse };
-                process_raw_mouse(mouse.usFlags, mouse.lLastX, mouse.lLastY);
-            }
-            RIM_TYPEKEYBOARD => {
-                let keyboard = unsafe { input.data.keyboard };
-                process_raw_keyboard(keyboard.VKey, keyboard.MakeCode, keyboard.Flags);
-            }
-            _ => {}
+        if input.header.dwType != RIM_TYPEMOUSE {
+            return;
         }
+        let mouse = unsafe { input.data.mouse };
+        process_raw_mouse(mouse.usFlags, mouse.lLastX, mouse.lLastY);
     }
 
-    fn process_raw_keyboard(virtual_key: u16, make_code: u16, flags: u16) {
-        if virtual_key == u8::MAX.into() {
-            return;
-        }
-        let extended = u32::from(flags) & RI_KEY_E0 != 0;
-        let virtual_key = normalize_raw_virtual_key(virtual_key, make_code, extended);
-        let down = u32::from(flags) & RI_KEY_BREAK == 0;
-        let Ok(mut guard) = hook_state().lock() else {
-            return;
-        };
-        let Some(state) = guard.as_mut() else {
-            return;
-        };
-        if !state.suppressed.load(Ordering::SeqCst) {
-            return;
-        }
-        if !state.raw_keyboard_observed {
-            state.raw_keyboard_observed = true;
+    fn forward_keyboard_input(
+        state: &mut HookState,
+        virtual_key: u16,
+        extended: bool,
+        down: bool,
+        pending: bool,
+    ) {
+        if !state.keyboard_hook_observed {
+            state.keyboard_hook_observed = true;
             state.stats.first_key_latency_ms = state
                 .remote_started_at
                 .map(|started_at| started_at.elapsed().as_millis() as u64);
-            tracing::info!(component = "input", "Windows raw keyboard capture active");
+            tracing::info!(
+                component = "input",
+                capture_source = "low_level_hook",
+                "Windows keyboard capture active"
+            );
         }
         let Some(usage) = virtual_key_to_remote_usage_with_extended(virtual_key, extended) else {
             state.stats.unsupported_key_events =
@@ -880,40 +1350,42 @@ mod win32 {
             return;
         };
 
-        if down {
-            let repeated = !state.remote_pressed_keys.insert(usage);
-            if repeated {
+        match update_remote_pressed_keys(&mut state.remote_pressed_keys, usage, down) {
+            RemoteKeyTransition::Forward => {}
+            RemoteKeyTransition::ForwardRepeat => {
                 state.stats.repeated_key_down_events =
                     state.stats.repeated_key_down_events.saturating_add(1);
-                if is_modifier_usage(usage) || usage == kvmflow_domain::KeyUsage::CAPS_LOCK {
-                    return;
-                }
             }
-        } else if !state.remote_pressed_keys.remove(&usage) {
-            state.stats.ignored_key_up_events = state.stats.ignored_key_up_events.saturating_add(1);
-            return;
+            RemoteKeyTransition::IgnoreRepeat => {
+                state.stats.repeated_key_down_events =
+                    state.stats.repeated_key_down_events.saturating_add(1);
+                return;
+            }
+            RemoteKeyTransition::IgnoreRelease => {
+                state.stats.ignored_key_up_events =
+                    state.stats.ignored_key_up_events.saturating_add(1);
+                return;
+            }
         }
 
         state.stats.record_key(usage, down);
-        send_input(
-            state,
-            InputEvent::Key {
-                usage,
-                action: if down { KeyAction::Down } else { KeyAction::Up },
-            },
-            true,
-        );
-    }
-
-    fn normalize_raw_virtual_key(virtual_key: u16, make_code: u16, extended: bool) -> u16 {
-        match virtual_key {
-            VK_SHIFT if make_code == 0x36 => VK_RSHIFT,
-            VK_SHIFT => VK_LSHIFT,
-            VK_CONTROL if extended => VK_RCONTROL,
-            VK_CONTROL => VK_LCONTROL,
-            VK_MENU if extended => VK_RMENU,
-            VK_MENU => VK_LMENU,
-            _ => virtual_key,
+        if let Some(key) = keyboard_semantic_name(usage) {
+            tracing::info!(
+                component = "input",
+                stage = "windows_capture",
+                key,
+                action = if down { "down" } else { "up" },
+                "Windows remote control key captured"
+            );
+        }
+        let event = InputEvent::Key {
+            usage,
+            action: if down { KeyAction::Down } else { KeyAction::Up },
+        };
+        if pending {
+            state.queue_pending_key_event(event);
+        } else {
+            send_input(state, event, true);
         }
     }
 
@@ -962,13 +1434,77 @@ mod win32 {
         )
     }
 
-    fn primary_screen_bounds() -> ScreenBounds {
-        ScreenBounds {
-            left: 0,
-            top: 0,
-            right: unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1) - 1,
-            bottom: unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(1) - 1,
+    fn refresh_display_topology() {
+        if let Ok(mut guard) = hook_state().lock()
+            && let Some(state) = guard.as_mut()
+        {
+            state.refresh_target_display();
         }
+    }
+
+    unsafe extern "system" fn foreground_window_hook(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        _hwnd: HWND,
+        object_id: i32,
+        _child_id: i32,
+        _thread_id: u32,
+        _event_time: u32,
+    ) {
+        if event == EVENT_OBJECT_LOCATIONCHANGE && object_id != 0 {
+            return;
+        }
+        refresh_foreground_fullscreen(unsafe { GetForegroundWindow() });
+    }
+
+    fn refresh_foreground_fullscreen(hwnd: HWND) {
+        let active = foreground_window_is_fullscreen(hwnd);
+        if let Ok(mut guard) = hook_state().lock()
+            && let Some(state) = guard.as_mut()
+            && state.foreground_fullscreen != active
+        {
+            state.foreground_fullscreen = active;
+            let _ = state
+                .events
+                .try_send(PlatformEvent::ForegroundFullscreenChanged { active });
+        }
+    }
+
+    fn foreground_window_is_fullscreen(hwnd: HWND) -> bool {
+        if hwnd.is_null()
+            || hwnd == unsafe { GetDesktopWindow() }
+            || hwnd == unsafe { GetShellWindow() }
+            || unsafe { IsWindowVisible(hwnd) } == 0
+            || unsafe { IsIconic(hwnd) } != 0
+        {
+            return false;
+        }
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_null() {
+            return false;
+        }
+        let mut window_rect = RECT::default();
+        let mut monitor_info = MONITORINFO::default();
+        monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if unsafe { GetWindowRect(hwnd, &mut window_rect) } == 0
+            || unsafe { GetMonitorInfoW(monitor, &mut monitor_info) } == 0
+        {
+            return false;
+        }
+        rect_covers_monitor(
+            (
+                window_rect.left,
+                window_rect.top,
+                window_rect.right,
+                window_rect.bottom,
+            ),
+            (
+                monitor_info.rcMonitor.left,
+                monitor_info.rcMonitor.top,
+                monitor_info.rcMonitor.right,
+                monitor_info.rcMonitor.bottom,
+            ),
+        )
     }
 
     fn clear_hook_state() {
@@ -983,20 +1519,24 @@ mod win32 {
             let virtual_key = data.vkCode as u16;
             let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let up = matches!(wparam as u32, WM_KEYUP | WM_SYSKEYUP);
-            if (down || up) && process_keyboard_hook(virtual_key, down) {
+            if (down || up)
+                && process_keyboard_hook(virtual_key, data.scanCode as u16, data.flags, down)
+            {
                 return 1;
             }
         }
         unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
     }
 
-    fn process_keyboard_hook(virtual_key: u16, down: bool) -> bool {
+    fn process_keyboard_hook(virtual_key: u16, scan_code: u16, flags: u32, down: bool) -> bool {
         let Ok(mut guard) = hook_state().lock() else {
             return false;
         };
         let Some(state) = guard.as_mut() else {
             return false;
         };
+        let extended = flags & LLKHF_EXTENDED != 0;
+        let virtual_key = normalize_windows_virtual_key(virtual_key, scan_code, extended);
         if down {
             state.pressed_keys.insert(virtual_key);
         } else {
@@ -1004,15 +1544,29 @@ mod win32 {
         }
         let suppressed = state.suppressed.load(Ordering::SeqCst);
         if (suppressed || state.transition_pending) && emergency_hotkey(&state.pressed_keys) {
+            let recovery_started_at = Instant::now();
             state.suppressed.store(false, Ordering::SeqCst);
             state.stats.log_and_reset("emergency_hotkey");
             state.pressed_keys.clear();
+            state.remote_pressed_keys.clear();
+            state.pending_key_events.clear();
             state.transition_pending = false;
             state.edge_switch_cooldown_until = Some(Instant::now() + EMERGENCY_EDGE_COOLDOWN);
-            let _ = state.events.try_send(PlatformEvent::EmergencyReturn);
+            let _ = state.events.try_send(PlatformEvent::EmergencyReturn {
+                response_ms: Some(recovery_started_at.elapsed().as_secs_f32() * 1_000.0),
+            });
             return true;
         }
-        suppressed
+        if suppressed || state.transition_pending {
+            forward_keyboard_input(
+                state,
+                virtual_key,
+                extended,
+                down,
+                state.transition_pending && !suppressed,
+            );
+        }
+        suppressed || state.transition_pending
     }
 
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1068,6 +1622,7 @@ mod win32 {
                     })
                     .is_ok()
                 {
+                    state.start_keyboard_capture();
                     state.transition_pending = true;
                     state.active_transition = Some(ActiveEdgeTransition {
                         edge: trigger.edge,
@@ -1167,7 +1722,9 @@ mod win32 {
                 );
                 state.stats.log_and_reset("reliable_queue_full");
                 state.suppressed.store(false, Ordering::SeqCst);
-                let _ = state.events.try_send(PlatformEvent::EmergencyReturn);
+                let _ = state
+                    .events
+                    .try_send(PlatformEvent::EmergencyReturn { response_ms: None });
             } else if movement {
                 state.stats.mouse_move_queue_drops =
                     state.stats.mouse_move_queue_drops.saturating_add(1);
@@ -1195,20 +1752,6 @@ mod win32 {
             || pressed.contains(&VK_RSHIFT);
         control && alt && shift && pressed.contains(&VK_F12)
     }
-
-    fn is_modifier_usage(usage: kvmflow_domain::KeyUsage) -> bool {
-        matches!(
-            usage,
-            kvmflow_domain::KeyUsage::LEFT_CONTROL
-                | kvmflow_domain::KeyUsage::RIGHT_CONTROL
-                | kvmflow_domain::KeyUsage::LEFT_SHIFT
-                | kvmflow_domain::KeyUsage::RIGHT_SHIFT
-                | kvmflow_domain::KeyUsage::LEFT_ALT
-                | kvmflow_domain::KeyUsage::RIGHT_ALT
-                | kvmflow_domain::KeyUsage::LEFT_GUI
-                | kvmflow_domain::KeyUsage::RIGHT_GUI
-        )
-    }
 }
 
 #[cfg(windows)]
@@ -1226,11 +1769,27 @@ pub enum WindowsInputAdapterError {
     RawInputWindowFailed,
     #[error("failed to register the Windows raw-input mouse device")]
     RawInputRegistrationFailed,
+    #[error("failed to enumerate active Windows displays")]
+    DisplayEnumerationFailed,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn display(id: &str, primary: bool, bounds: ScreenBounds) -> WindowsDisplay {
+        WindowsDisplay {
+            target: DisplayTarget {
+                id: id.into(),
+                primary,
+                left: bounds.left,
+                top: bounds.top,
+                width: (bounds.right - bounds.left + 1) as u32,
+                height: (bounds.bottom - bounds.top + 1) as u32,
+            },
+            bounds,
+        }
+    }
 
     #[test]
     fn maps_windows_modifiers_to_macos_shortcut_conventions() {
@@ -1280,7 +1839,14 @@ mod tests {
             virtual_key_to_remote_usage(VK_CAPITAL),
             Some(KeyUsage(0x39))
         );
-        assert_eq!(virtual_key_to_remote_usage(VK_DELETE), Some(KeyUsage(0x4c)));
+        assert_eq!(
+            virtual_key_to_remote_usage(VK_BACK),
+            Some(KeyUsage::BACKSPACE)
+        );
+        assert_eq!(
+            virtual_key_to_remote_usage(VK_DELETE),
+            Some(KeyUsage::FORWARD_DELETE)
+        );
         assert_eq!(
             virtual_key_to_remote_usage(VK_RCONTROL),
             Some(KeyUsage::RIGHT_GUI)
@@ -1297,6 +1863,42 @@ mod tests {
             virtual_key_to_remote_usage(VK_RWIN),
             Some(KeyUsage::RIGHT_CONTROL)
         );
+    }
+
+    #[test]
+    fn maps_common_editing_and_navigation_keys() {
+        let expected = [
+            (VK_RETURN, KeyUsage::ENTER),
+            (VK_BACK, KeyUsage::BACKSPACE),
+            (VK_TAB, KeyUsage::TAB),
+            (VK_HOME, KeyUsage::HOME),
+            (VK_PRIOR, KeyUsage::PAGE_UP),
+            (VK_DELETE, KeyUsage::FORWARD_DELETE),
+            (VK_END, KeyUsage::END),
+            (VK_NEXT, KeyUsage::PAGE_DOWN),
+            (VK_LEFT, KeyUsage::LEFT_ARROW),
+            (VK_RIGHT, KeyUsage::RIGHT_ARROW),
+            (VK_UP, KeyUsage::UP_ARROW),
+            (VK_DOWN, KeyUsage::DOWN_ARROW),
+        ];
+
+        for (virtual_key, usage) in expected {
+            assert_eq!(virtual_key_to_remote_usage(virtual_key), Some(usage));
+        }
+    }
+
+    #[test]
+    fn diagnostics_name_only_safe_control_keys() {
+        assert_eq!(
+            keyboard_semantic_name(KeyUsage::BACKSPACE),
+            Some("backspace")
+        );
+        assert_eq!(
+            keyboard_semantic_name(KeyUsage::FORWARD_DELETE),
+            Some("forward_delete")
+        );
+        assert_eq!(keyboard_semantic_name(KeyUsage::UP_ARROW), Some("arrow_up"));
+        assert_eq!(keyboard_semantic_name(KeyUsage::A), None);
     }
 
     #[test]
@@ -1338,12 +1940,160 @@ mod tests {
     }
 
     #[test]
+    fn hook_metadata_distinguishes_left_and_right_modifiers() {
+        assert_eq!(
+            normalize_windows_virtual_key(VK_SHIFT, 0x2a, false),
+            VK_LSHIFT
+        );
+        assert_eq!(
+            normalize_windows_virtual_key(VK_SHIFT, 0x36, false),
+            VK_RSHIFT
+        );
+        assert_eq!(
+            normalize_windows_virtual_key(VK_CONTROL, 0x1d, false),
+            VK_LCONTROL
+        );
+        assert_eq!(
+            normalize_windows_virtual_key(VK_CONTROL, 0x1d, true),
+            VK_RCONTROL
+        );
+        assert_eq!(
+            normalize_windows_virtual_key(VK_MENU, 0x38, false),
+            VK_LMENU
+        );
+        assert_eq!(normalize_windows_virtual_key(VK_MENU, 0x38, true), VK_RMENU);
+    }
+
+    #[test]
+    fn remote_key_state_preserves_arbitrary_modifier_combinations() {
+        let mut pressed = std::collections::HashSet::new();
+
+        assert_eq!(
+            update_remote_pressed_keys(&mut pressed, KeyUsage::LEFT_GUI, true),
+            RemoteKeyTransition::Forward
+        );
+        assert_eq!(
+            update_remote_pressed_keys(&mut pressed, KeyUsage::RIGHT_SHIFT, true),
+            RemoteKeyTransition::Forward
+        );
+        assert_eq!(
+            update_remote_pressed_keys(&mut pressed, KeyUsage::UP_ARROW, true),
+            RemoteKeyTransition::Forward
+        );
+        assert!(pressed.contains(&KeyUsage::LEFT_GUI));
+        assert!(pressed.contains(&KeyUsage::RIGHT_SHIFT));
+        assert!(pressed.contains(&KeyUsage::UP_ARROW));
+        assert_eq!(
+            update_remote_pressed_keys(&mut pressed, KeyUsage::UP_ARROW, false),
+            RemoteKeyTransition::Forward
+        );
+        assert!(pressed.contains(&KeyUsage::LEFT_GUI));
+        assert!(pressed.contains(&KeyUsage::RIGHT_SHIFT));
+    }
+
+    #[test]
+    fn remote_key_state_forwards_repeat_only_for_non_modifiers() {
+        let mut pressed = std::collections::HashSet::new();
+
+        assert_eq!(
+            update_remote_pressed_keys(&mut pressed, KeyUsage::A, true),
+            RemoteKeyTransition::Forward
+        );
+        assert_eq!(
+            update_remote_pressed_keys(&mut pressed, KeyUsage::A, true),
+            RemoteKeyTransition::ForwardRepeat
+        );
+        assert_eq!(
+            update_remote_pressed_keys(&mut pressed, KeyUsage::LEFT_GUI, true),
+            RemoteKeyTransition::Forward
+        );
+        assert_eq!(
+            update_remote_pressed_keys(&mut pressed, KeyUsage::LEFT_GUI, true),
+            RemoteKeyTransition::IgnoreRepeat
+        );
+    }
+
+    #[test]
+    fn display_selection_prefers_configured_monitor_with_negative_coordinates() {
+        let displays = vec![
+            display(
+                r"\\.\DISPLAY1",
+                true,
+                ScreenBounds {
+                    left: 0,
+                    top: 0,
+                    right: 1919,
+                    bottom: 1079,
+                },
+            ),
+            display(
+                r"\\.\DISPLAY2",
+                false,
+                ScreenBounds {
+                    left: -2560,
+                    top: -360,
+                    right: -1,
+                    bottom: 1079,
+                },
+            ),
+        ];
+
+        let selected = select_display(&displays, Some(r"\\.\DISPLAY2")).unwrap();
+
+        assert_eq!(selected.target.id, r"\\.\DISPLAY2");
+        assert_eq!(selected.bounds.left, -2560);
+        assert_eq!(selected.bounds.top, -360);
+        assert_eq!(selected.target.width, 2560);
+        assert_eq!(selected.target.height, 1440);
+    }
+
+    #[test]
+    fn unavailable_display_falls_back_to_primary_monitor() {
+        let displays = vec![
+            display(
+                r"\\.\DISPLAY2",
+                false,
+                ScreenBounds {
+                    left: 1920,
+                    top: 0,
+                    right: 3839,
+                    bottom: 1079,
+                },
+            ),
+            display(
+                r"\\.\DISPLAY1",
+                true,
+                ScreenBounds {
+                    left: 0,
+                    top: 0,
+                    right: 1919,
+                    bottom: 1079,
+                },
+            ),
+        ];
+
+        let selected = select_display(&displays, Some(r"\\.\DISPLAY9")).unwrap();
+
+        assert_eq!(selected.target.id, r"\\.\DISPLAY1");
+        assert!(selected.target.primary);
+    }
+
+    #[test]
     fn relative_raw_pointer_events_preserve_each_delta() {
         let mut state = RawPointerState::default();
 
         assert_eq!(state.movement(false, 8, -3), Some((8, -3)));
         assert_eq!(state.movement(false, 8, -3), Some((8, -3)));
         assert_eq!(state.movement(false, 0, 0), None);
+    }
+
+    #[test]
+    fn fullscreen_detection_accepts_monitor_cover_but_rejects_maximized_work_area() {
+        let monitor = (0, 0, 1920, 1080);
+
+        assert!(rect_covers_monitor((0, 0, 1920, 1080), monitor));
+        assert!(rect_covers_monitor((-1, -1, 1921, 1081), monitor));
+        assert!(!rect_covers_monitor((0, 0, 1920, 1040), monitor));
     }
 
     #[test]
@@ -1461,6 +2211,24 @@ mod tests {
                 position: 0.25,
             })
         );
+    }
+
+    #[test]
+    fn occupied_edge_never_triggers_until_it_becomes_available() {
+        let bounds = ScreenBounds {
+            left: 0,
+            top: 0,
+            right: 1919,
+            bottom: 1079,
+        };
+        let mut detector = EdgeDetector::new(ScreenEdge::Right);
+        detector.set_enabled(true);
+        detector.set_blocked(true);
+
+        assert_eq!(detector.observe(bounds, 1919, 500, false), None);
+
+        detector.set_blocked(false);
+        assert!(detector.observe(bounds, 1919, 500, false).is_some());
     }
 
     #[test]

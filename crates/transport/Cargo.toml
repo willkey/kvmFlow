@@ -10,6 +10,7 @@ authors.workspace = true
 ed25519-dalek.workspace = true
 kvmflow-domain.workspace = true
 kvmflow-protocol.workspace = true
+if-addrs.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
@@ -21,9 +22,6 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-if-addrs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

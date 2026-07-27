@@ -1,4 +1,4 @@
-use kvmflow_domain::{InputEvent, PermissionStatus, ScreenEdge};
+use kvmflow_domain::{ClipboardPayload, InputEvent, PermissionStatus, ScreenEdge};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -6,6 +6,7 @@ pub enum PlatformCommand {
     SetInputSuppressed(bool),
     SetEdgeSwitchEnabled(bool),
     SetEdgeSwitchEdge(ScreenEdge),
+    SetEdgeSwitchDisplay(String),
     BeginEdgeTransition { edge: ScreenEdge, position: f32 },
     RestoreLocalPointer { position: f32 },
     Inject(InputEvent),
@@ -13,6 +14,7 @@ pub enum PlatformCommand {
     PrepareRemotePointer { edge: ScreenEdge, position: f32 },
     RefreshPermission,
     OpenAccessibilitySettings,
+    ApplyClipboard(ClipboardPayload),
     Shutdown,
 }
 
@@ -20,8 +22,12 @@ pub enum PlatformCommand {
 pub enum PlatformEvent {
     InputCaptured(InputEvent),
     LocalEdgeReached { edge: ScreenEdge, position: f32 },
+    TargetDisplayChanged { display_id: String },
+    ForegroundFullscreenChanged { active: bool },
+    ClipboardChanged(ClipboardPayload),
+    ClipboardFailed(String),
     RemoteEdgeReached { position: f32 },
-    EmergencyReturn,
+    EmergencyReturn { response_ms: Option<f32> },
     PermissionChanged(PermissionStatus),
     RemotePointerPrepared,
     AdapterFailed(String),

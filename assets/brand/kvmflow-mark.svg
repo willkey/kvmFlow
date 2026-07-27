@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">kvmFlow</title>
+  <rect width="64" height="64" rx="15" fill="#101820"/>
+  <path d="M17 18v28M17 32h10l12-14M27 32l12 14" fill="none" stroke="#F5F8FA" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M43 18h4v28h-4" fill="none" stroke="#27D3A2" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="47" cy="18" r="4" fill="#4CC9F0"/>
+  <circle cx="47" cy="46" r="4" fill="#27D3A2"/>
+</svg>

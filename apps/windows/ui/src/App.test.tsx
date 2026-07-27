@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: tauriMocks.listen }));
 type TauriEventHandler = (event: { payload: unknown }) => void;
 
 const initialSnapshot: AppSnapshot = {
-  schemaVersion: 2,
+  schemaVersion: 6,
   role: "windowsController",
   phase: "running",
   windowState: "open",
@@ -46,6 +46,22 @@ const initialSnapshot: AppSnapshot = {
     peakMemoryBytes: null,
     averageCpuPercent: null,
     peakCpuPercent: null,
+    kvm: {
+      successfulEntries: 0,
+      successfulReturns: 0,
+      transitionFailures: 0,
+      emergencyReturns: 0,
+      emergencyReturnSampleCount: 0,
+      peakEmergencyReturnMs: null,
+      disconnects: 0,
+      reconnects: 0,
+      networkRecoveries: 0,
+      wakeRecoveries: 0,
+      latencySampleCount: 0,
+      averageLatencyMs: null,
+      p95LatencyMs: null,
+      peakLatencyMs: null,
+    },
   },
   kvm: {
     trust: "unpaired",
@@ -53,15 +69,46 @@ const initialSnapshot: AppSnapshot = {
     control: "local",
     permission: "unknown",
     localPolicy: "allowed",
+    controlEnabled: true,
+    gameModeEnabled: true,
+    foregroundFullscreen: false,
+    remoteControlAvailable: true,
+    clipboard: {
+      transferState: "idle",
+      lastError: null,
+      lastUpdatedUnixMs: null,
+      history: [],
+    },
     screenEdge: "bottom",
+    targetDisplayId: null,
     endpoint: null,
     peerDeviceName: null,
     pairing: null,
     latencyMs: null,
     sessionId: null,
+    consecutiveFailures: 0,
     lastError: null,
   },
 };
+
+const availableDisplays = [
+  {
+    id: "\\\\.\\DISPLAY1",
+    primary: true,
+    left: 0,
+    top: 0,
+    width: 1920,
+    height: 1080,
+  },
+  {
+    id: "\\\\.\\DISPLAY2",
+    primary: false,
+    left: 1920,
+    top: 0,
+    width: 2560,
+    height: 1440,
+  },
+];
 
 function cloneSnapshot(): AppSnapshot {
   return structuredClone(initialSnapshot);
@@ -73,19 +120,25 @@ async function flushPromises(): Promise<void> {
   });
 }
 
+function openDiagnostics(): void {
+  fireEvent.click(screen.getByText("运行与诊断"));
+}
+
 describe("App", () => {
   let eventHandlers: Map<string, TauriEventHandler>;
   let snapshotUnlisten: ReturnType<typeof vi.fn>;
-  let keyboardUnlisten: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.useFakeTimers();
     eventHandlers = new Map();
     snapshotUnlisten = vi.fn();
-    keyboardUnlisten = vi.fn();
     tauriMocks.invoke.mockImplementation((command: string) => {
       if (command === "get_snapshot") {
         return Promise.resolve(cloneSnapshot());
+      }
+
+      if (command === "list_displays") {
+        return Promise.resolve(availableDisplays);
       }
 
       if (command === "export_foundation_report") {
@@ -97,9 +150,7 @@ describe("App", () => {
     tauriMocks.listen.mockImplementation(
       async (eventName: string, callback: TauriEventHandler) => {
         eventHandlers.set(eventName, callback);
-        return eventName === "engine://snapshot"
-          ? snapshotUnlisten
-          : keyboardUnlisten;
+        return snapshotUnlisten;
       },
     );
   });
@@ -115,29 +166,24 @@ describe("App", () => {
 
     await flushPromises();
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
     expect(tauriMocks.invoke).toHaveBeenCalledWith("get_snapshot");
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("list_displays");
   });
 
-  it("registers snapshot and keyboard listeners and unlistens on unmount", async () => {
+  it("registers the snapshot listener and unlistens on unmount", async () => {
     const { unmount } = render(<App />);
 
     await flushPromises();
 
-    expect(tauriMocks.listen).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.listen).toHaveBeenCalledTimes(1);
     expect(tauriMocks.listen).toHaveBeenCalledWith(
       "engine://snapshot",
       expect.any(Function),
     );
-    expect(tauriMocks.listen).toHaveBeenCalledWith(
-      "engine://keyboard",
-      expect.any(Function),
-    );
-
     unmount();
 
     expect(snapshotUnlisten).toHaveBeenCalledTimes(1);
-    expect(keyboardUnlisten).toHaveBeenCalledTimes(1);
   });
 
   it("does not poll after one fake minute", async () => {
@@ -148,7 +194,46 @@ describe("App", () => {
       await vi.advanceTimersByTimeAsync(60_000);
     });
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes display topology when the native adapter publishes a system change", async () => {
+    const onlineSnapshot = cloneSnapshot();
+    onlineSnapshot.kvm.link = "online";
+    onlineSnapshot.kvm.trust = "paired";
+    onlineSnapshot.kvm.targetDisplayId = "\\\\.\\DISPLAY1";
+    let currentDisplays = availableDisplays;
+    tauriMocks.invoke.mockImplementation((command: string) => {
+      if (command === "get_snapshot") {
+        return Promise.resolve(onlineSnapshot);
+      }
+      if (command === "list_displays") {
+        return Promise.resolve(currentDisplays);
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    await flushPromises();
+
+    expect(screen.getByRole("radio", { name: "右侧" })).toBeDisabled();
+    expect(screen.getByRole("radio", { name: "下方" })).toBeEnabled();
+
+    currentDisplays = [
+      availableDisplays[0],
+      {
+        ...availableDisplays[1],
+        left: 0,
+        top: 1080,
+      },
+    ];
+    act(() => {
+      eventHandlers.get("engine://snapshot")?.({ payload: onlineSnapshot });
+    });
+    await flushPromises();
+
+    expect(screen.getByRole("radio", { name: "右侧" })).toBeEnabled();
+    expect(screen.getByRole("radio", { name: "下方" })).toBeDisabled();
   });
 
   it("keeps an event snapshot when the pending initial snapshot resolves later", async () => {
@@ -158,6 +243,9 @@ describe("App", () => {
         return new Promise<AppSnapshot>((resolve) => {
           resolveInitialSnapshot = resolve;
         });
+      }
+      if (command === "list_displays") {
+        return Promise.resolve(availableDisplays);
       }
 
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -186,6 +274,7 @@ describe("App", () => {
     initialSnapshotAfterEvent.build.buildId = "stale-initial-build";
     resolveInitialSnapshot?.(initialSnapshotAfterEvent);
     await flushPromises();
+    openDiagnostics();
 
     expect(screen.getByText("event-build")).toBeVisible();
     expect(screen.queryByText("stale-initial-build")).not.toBeInTheDocument();
@@ -218,6 +307,7 @@ describe("App", () => {
     act(() => {
       eventHandlers.get("engine://snapshot")?.({ payload: emittedSnapshot });
     });
+    openDiagnostics();
 
     expect(screen.getByText("build-emitted")).toBeVisible();
     expect(screen.getByText("4", { selector: ".metric dd" })).toBeVisible();
@@ -232,14 +322,62 @@ describe("App", () => {
     expect(screen.getByText("未通过")).toBeVisible();
   });
 
+  it("shows a persistent notice after three consecutive connection failures", async () => {
+    render(<App />);
+    await flushPromises();
+
+    const failedSnapshot = cloneSnapshot();
+    failedSnapshot.kvm.link = "backoff";
+    failedSnapshot.kvm.consecutiveFailures = 3;
+    act(() => {
+      eventHandlers.get("engine://snapshot")?.({ payload: failedSnapshot });
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "已连续重连失败 3 次，程序仍会每 5 秒重试",
+    );
+  });
+
+  it("renders automatic KVM cycle, recovery, and latency progress", async () => {
+    render(<App />);
+    await flushPromises();
+
+    const progressSnapshot = cloneSnapshot();
+    progressSnapshot.validation.kvm = {
+      successfulEntries: 12,
+      successfulReturns: 11,
+      transitionFailures: 1,
+      emergencyReturns: 2,
+      emergencyReturnSampleCount: 2,
+      peakEmergencyReturnMs: 0.8,
+      disconnects: 3,
+      reconnects: 3,
+      networkRecoveries: 2,
+      wakeRecoveries: 1,
+      latencySampleCount: 120,
+      averageLatencyMs: 4.25,
+      p95LatencyMs: 9,
+      peakLatencyMs: 15.5,
+    };
+    act(() => {
+      eventHandlers.get("engine://snapshot")?.({ payload: progressSnapshot });
+    });
+    openDiagnostics();
+
+    expect(screen.getByText("完整切换 11 / 100")).toBeVisible();
+    expect(screen.getByText("12 / 11")).toBeVisible();
+    expect(screen.getByText("9.0 ms")).toBeVisible();
+    expect(screen.getByText("4.3 ms / 15.5 ms")).toBeVisible();
+  });
+
   it("exports the foundation report once and renders its path", async () => {
     render(<App />);
     await flushPromises();
 
-    fireEvent.click(screen.getByRole("button", { name: "导出基线报告" }));
+    fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
     await flushPromises();
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(3);
     expect(tauriMocks.invoke).toHaveBeenLastCalledWith("export_foundation_report");
     expect(
       screen.getByText("C:\\kvmFlow\\diagnostics\\foundation-report.json"),
@@ -250,6 +388,9 @@ describe("App", () => {
     tauriMocks.invoke.mockImplementation((command: string) => {
       if (command === "get_snapshot") {
         return Promise.resolve(cloneSnapshot());
+      }
+      if (command === "list_displays") {
+        return Promise.resolve(availableDisplays);
       }
       if (command === "enter_control") {
         return Promise.resolve();
@@ -289,6 +430,9 @@ describe("App", () => {
       if (command === "get_snapshot") {
         return Promise.resolve(cloneSnapshot());
       }
+      if (command === "list_displays") {
+        return Promise.resolve(availableDisplays);
+      }
       if (command === "configure_screen_edge") {
         return Promise.resolve();
       }
@@ -306,10 +450,10 @@ describe("App", () => {
       eventHandlers.get("engine://snapshot")?.({ payload: onlineSnapshot });
     });
 
-    fireEvent.click(screen.getByRole("radio", { name: "右侧" }));
+    fireEvent.click(screen.getByRole("radio", { name: "上方" }));
     await flushPromises();
     expect(tauriMocks.invoke).toHaveBeenLastCalledWith("configure_screen_edge", {
-      edge: "right",
+      edge: "top",
     });
 
     onlineSnapshot.kvm.control = "remote";
@@ -319,6 +463,111 @@ describe("App", () => {
     expect(screen.queryByRole("button", { name: "返回本机" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "开始控制" })).not.toBeInTheDocument();
     expect(screen.getByRole("radio", { name: "下方" })).toBeDisabled();
+  });
+
+  it("selects which Windows display enters the Mac", async () => {
+    tauriMocks.invoke.mockImplementation((command: string) => {
+      if (command === "get_snapshot") {
+        return Promise.resolve(cloneSnapshot());
+      }
+      if (command === "list_displays") {
+        return Promise.resolve(availableDisplays);
+      }
+      if (command === "configure_target_display") {
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    await flushPromises();
+
+    const onlineSnapshot = cloneSnapshot();
+    onlineSnapshot.kvm.link = "online";
+    onlineSnapshot.kvm.trust = "paired";
+    onlineSnapshot.kvm.targetDisplayId = "\\\\.\\DISPLAY1";
+    act(() => {
+      eventHandlers.get("engine://snapshot")?.({ payload: onlineSnapshot });
+    });
+
+    expect(screen.getByRole("radio", { name: "右侧" })).toBeDisabled();
+    expect(screen.getByRole("radio", { name: "左侧" })).toBeEnabled();
+    expect(screen.getByText("灰色方向已有 Windows 显示器，不能用于进入 Mac")).toBeVisible();
+
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "进入 Mac 的 Windows 显示器" }),
+      { target: { value: "\\\\.\\DISPLAY2" } },
+    );
+    await flushPromises();
+
+    expect(tauriMocks.invoke).toHaveBeenLastCalledWith(
+      "configure_target_display",
+      { displayId: "\\\\.\\DISPLAY2" },
+    );
+
+    onlineSnapshot.kvm.targetDisplayId = "\\\\.\\DISPLAY2";
+    act(() => {
+      eventHandlers.get("engine://snapshot")?.({ payload: onlineSnapshot });
+    });
+    expect(screen.getByRole("radio", { name: "左侧" })).toBeDisabled();
+    expect(screen.getByRole("radio", { name: "右侧" })).toBeEnabled();
+  });
+
+  it("reapplies and clears persistent clipboard history from Windows", async () => {
+    tauriMocks.invoke.mockImplementation((command: string) => {
+      if (command === "get_snapshot") {
+        const snapshot = cloneSnapshot();
+        snapshot.kvm.clipboard.history = [
+          {
+            id: "history-text",
+            capturedAtUnixMs: 1_700_000_000_000,
+            kind: "text",
+            preview: "待重新复制的文本",
+            sizeBytes: 18,
+            available: true,
+          },
+          {
+            id: "history-file",
+            capturedAtUnixMs: 1_700_000_100_000,
+            kind: "files",
+            preview: "已删除的文件.txt",
+            sizeBytes: 0,
+            available: false,
+          },
+        ];
+        return Promise.resolve(snapshot);
+      }
+      if (command === "list_displays") {
+        return Promise.resolve(availableDisplays);
+      }
+      if (
+        command === "activate_clipboard_history" ||
+        command === "clear_clipboard_history"
+      ) {
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    await flushPromises();
+
+    fireEvent.click(screen.getByText("剪贴板历史"));
+    expect(screen.getByText("待重新复制的文本")).toBeVisible();
+    expect(screen.getByRole("button", { name: "文件不可用" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "重新复制" }));
+    await flushPromises();
+    expect(tauriMocks.invoke).toHaveBeenLastCalledWith(
+      "activate_clipboard_history",
+      { id: "history-text" },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "清空" }));
+    await flushPromises();
+    expect(tauriMocks.invoke).toHaveBeenLastCalledWith(
+      "clear_clipboard_history",
+    );
   });
 
   it("keeps the storage fallback notice visible until a newer snapshot clears it", async () => {
@@ -357,7 +606,7 @@ describe("App", () => {
     });
 
     expect(screen.getByRole("alert")).toHaveTextContent("无法加载状态");
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
   });
 
   it("shows a concise Chinese error when the snapshot listener rejects", async () => {
@@ -367,6 +616,9 @@ describe("App", () => {
         return new Promise<AppSnapshot>((resolve) => {
           resolveInitialSnapshot = resolve;
         });
+      }
+      if (command === "list_displays") {
+        return Promise.resolve(availableDisplays);
       }
 
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -380,6 +632,7 @@ describe("App", () => {
 
     resolveInitialSnapshot?.(cloneSnapshot());
     await flushPromises();
+    openDiagnostics();
 
     expect(screen.getByText("fixture-build")).toBeVisible();
     expect(screen.getByRole("alert")).toHaveTextContent("无法连接状态更新");
@@ -408,44 +661,7 @@ describe("App", () => {
     });
 
     expect(screen.getByRole("alert")).toHaveTextContent("收到无效状态数据");
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(1);
-  });
-
-  it("renders mapped pressed keys and recent keyboard transitions", async () => {
-    render(<App />);
-    await flushPromises();
-
-    act(() => {
-      eventHandlers.get("engine://keyboard")?.({
-        payload: {
-          sequence: 2,
-          pressed: [0xe3, 0x52],
-          recent: [
-            { sequence: 2, usage: 0x52, action: "down" },
-            { sequence: 1, usage: 0xe3, action: "down" },
-          ],
-        },
-      });
-    });
-
-    const details = screen.getByText("键盘交互").closest("details");
-    expect(details).not.toHaveAttribute("open");
-    fireEvent.click(screen.getByText("键盘交互"));
-    const keyboard = screen.getByLabelText("Windows 实时键盘状态");
-    expect(keyboard.querySelector('[data-usage="227"]')).toHaveAttribute(
-      "data-pressed",
-      "true",
-    );
-    expect(keyboard.querySelector('[data-usage="82"]')).toHaveAttribute(
-      "data-pressed",
-      "true",
-    );
-    expect(screen.getByText(/映射后发送 · 当前按下 2 个键/)).toBeVisible();
-    expect(screen.getAllByText("按下")).toHaveLength(2);
-    expect(screen.getAllByText("Ctrl").length).toBeGreaterThan(0);
-
-    fireEvent.click(screen.getByRole("button", { name: "全尺寸键盘" }));
-    expect(screen.getByLabelText("数字键盘")).toBeVisible();
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
   });
 
   it("unlistens when an async listener resolves after unmount", async () => {
@@ -464,6 +680,5 @@ describe("App", () => {
     await flushPromises();
 
     expect(snapshotUnlisten).toHaveBeenCalledTimes(1);
-    expect(keyboardUnlisten).toHaveBeenCalledTimes(1);
   });
 });

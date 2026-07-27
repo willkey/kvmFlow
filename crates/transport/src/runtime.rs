@@ -1,11 +1,17 @@
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use kvmflow_domain::{InputEvent, LocalControlPolicy, NetworkEndpoint, ScreenEdge};
-use kvmflow_protocol::ProtocolMessage;
+use kvmflow_domain::{
+    ClipboardHistoryItem, ClipboardPayload, ClipboardTransferState, InputEvent, LocalControlPolicy,
+    NetworkEndpoint, ScreenEdge,
+};
+use kvmflow_protocol::{ChannelPurpose, ProtocolMessage};
 use tokio::{
     sync::{Notify, mpsc},
     time::{Instant, MissedTickBehavior},
@@ -13,7 +19,11 @@ use tokio::{
 
 use crate::{
     ChannelTrust, ConfigStore, DeviceIdentity, MacRuntimeConfig, SecureChannel, SecureListener,
-    TransportError, TrustedPeer, WindowsRuntimeConfig, connect,
+    TransportError, TrustedPeer, WindowsRuntimeConfig,
+    bulk::{BulkChannel, BulkMessage},
+    clipboard_history::{ClipboardHistoryStore, activated_payload_id},
+    clipboard_transfer::{IncomingClipboardTransfer, OutgoingClipboardTransfer},
+    connect,
 };
 
 const RUNTIME_COMMAND_CAPACITY: usize = 128;
@@ -25,11 +35,19 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUSE_MOVEMENT_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
+const NETWORK_CHANGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryTrigger {
+    NetworkChanged,
+    SystemResumed,
+}
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
     ConfigureEndpoint(NetworkEndpoint),
     ConfigureScreenEdge(ScreenEdge),
+    ConfigureTargetDisplay(String),
     ConfigureListenPort(u16),
     ConfirmPairing,
     RejectPairing,
@@ -46,7 +64,14 @@ pub enum RuntimeCommand {
     },
     SendInput(InputEvent),
     ReleaseAll,
+    RecoverNow(RecoveryTrigger),
+    SetControlEnabled(bool),
+    SetGameModeEnabled(bool),
     SetLocalPolicy(LocalControlPolicy),
+    SetClipboard(ClipboardPayload),
+    ClipboardUpdated,
+    ActivateClipboardHistory(String),
+    ClearClipboardHistory,
     Disconnect,
     Shutdown,
 }
@@ -59,6 +84,20 @@ pub enum RuntimeEvent {
     LocalPolicyChanged {
         policy: LocalControlPolicy,
     },
+    ControlEnabledChanged {
+        enabled: bool,
+    },
+    GameModeEnabledChanged {
+        enabled: bool,
+    },
+    ClipboardTransferChanged {
+        state: ClipboardTransferState,
+        error: Option<String>,
+        updated_at_unix_ms: Option<u64>,
+    },
+    ClipboardReceived(ClipboardPayload),
+    ClipboardHistoryChanged(Vec<ClipboardHistoryItem>),
+    ClipboardHistoryActivated(ClipboardPayload),
     ScreenEdgeChanged {
         edge: ScreenEdge,
     },
@@ -78,6 +117,9 @@ pub enum RuntimeEvent {
         attempt_id: u64,
         failure_count: u32,
         message: String,
+    },
+    RecoveryTriggered {
+        trigger: RecoveryTrigger,
     },
     Pairing {
         code: String,
@@ -128,6 +170,7 @@ pub enum RuntimeEvent {
 pub struct RuntimeHandle {
     command_tx: mpsc::Sender<RuntimeCommand>,
     mouse_movement: Option<MouseMovementSender>,
+    clipboard: ClipboardMailbox,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -140,6 +183,13 @@ impl std::fmt::Debug for RuntimeHandle {
 
 impl RuntimeHandle {
     pub async fn send(&self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
+        let command = match command {
+            RuntimeCommand::SetClipboard(payload) => {
+                self.clipboard.replace(payload);
+                RuntimeCommand::ClipboardUpdated
+            }
+            command => command,
+        };
         if let Some(mouse_movement) = self.mouse_movement.as_ref() {
             if let RuntimeCommand::SendInput(InputEvent::MouseMove { dx, dy }) = &command {
                 if self.command_tx.is_closed() {
@@ -178,18 +228,22 @@ pub fn spawn_windows_runtime(
     let (command_tx, command_rx) = mpsc::channel(RUNTIME_COMMAND_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(RUNTIME_EVENT_CAPACITY);
     let (mouse_movement_tx, mouse_movement_rx) = mouse_movement_channel();
+    let clipboard = ClipboardMailbox::default();
+    spawn_network_change_watcher(command_tx.clone());
     tokio::spawn(run_windows_runtime(
         identity,
         store,
         config,
         command_rx,
         mouse_movement_rx,
+        clipboard.clone(),
         event_tx,
     ));
     RuntimeBridge {
         handle: RuntimeHandle {
             command_tx,
             mouse_movement: Some(mouse_movement_tx),
+            clipboard,
         },
         events: event_rx,
     }
@@ -202,15 +256,376 @@ pub fn spawn_macos_runtime(
 ) -> RuntimeBridge {
     let (command_tx, command_rx) = mpsc::channel(RUNTIME_COMMAND_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(RUNTIME_EVENT_CAPACITY);
+    let clipboard = ClipboardMailbox::default();
+    spawn_network_change_watcher(command_tx.clone());
     tokio::spawn(run_macos_runtime(
-        identity, store, config, command_rx, event_tx,
+        identity,
+        store,
+        config,
+        command_rx,
+        clipboard.clone(),
+        event_tx,
     ));
     RuntimeBridge {
         handle: RuntimeHandle {
             command_tx,
             mouse_movement: None,
+            clipboard,
         },
         events: event_rx,
+    }
+}
+
+#[derive(Clone, Default)]
+struct ClipboardMailbox {
+    latest: Arc<Mutex<Option<ClipboardPayload>>>,
+}
+
+impl ClipboardMailbox {
+    fn replace(&self, payload: ClipboardPayload) {
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *latest = Some(payload);
+    }
+
+    fn current(&self) -> Option<ClipboardPayload> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+struct ClipboardSession {
+    mailbox: ClipboardMailbox,
+    data_dir: std::path::PathBuf,
+    prune_incoming_before_receive: bool,
+    outgoing: Option<OutgoingClipboardTransfer>,
+    incoming: Option<IncomingClipboardTransfer>,
+    prepared_tx: mpsc::Sender<Result<OutgoingClipboardTransfer, String>>,
+    prepared_rx: mpsc::Receiver<Result<OutgoingClipboardTransfer, String>>,
+    last_requested_id: Option<String>,
+    outgoing_started_at: Option<Instant>,
+    outgoing_bytes: u64,
+    incoming_started_at: Option<Instant>,
+    incoming_bytes: u64,
+}
+
+struct WindowsRuntimeServices<'a> {
+    store: &'a ConfigStore,
+    clipboard: &'a ClipboardMailbox,
+    history: &'a ClipboardHistoryStore,
+    events: &'a mpsc::Sender<RuntimeEvent>,
+}
+
+struct WindowsConnectionContext<'a> {
+    address: SocketAddr,
+    identity: &'a DeviceIdentity,
+    endpoint: NetworkEndpoint,
+}
+
+struct MacChannelServices<'a> {
+    listener: &'a mut SecureListener,
+    store: &'a ConfigStore,
+    clipboard: &'a ClipboardMailbox,
+    events: &'a mpsc::Sender<RuntimeEvent>,
+}
+
+impl ClipboardSession {
+    fn new(
+        mailbox: ClipboardMailbox,
+        data_dir: std::path::PathBuf,
+        prune_incoming_before_receive: bool,
+    ) -> Self {
+        let (prepared_tx, prepared_rx) = mpsc::channel(2);
+        Self {
+            mailbox,
+            data_dir,
+            prune_incoming_before_receive,
+            outgoing: None,
+            incoming: None,
+            prepared_tx,
+            prepared_rx,
+            last_requested_id: None,
+            outgoing_started_at: None,
+            outgoing_bytes: 0,
+            incoming_started_at: None,
+            incoming_bytes: 0,
+        }
+    }
+
+    async fn request_current(&mut self, events: &mpsc::Sender<RuntimeEvent>) {
+        let Some(payload) = self.mailbox.current() else {
+            return;
+        };
+        if self.last_requested_id.as_deref() == Some(payload.id.as_str()) {
+            return;
+        }
+        self.last_requested_id = Some(payload.id.clone());
+        self.outgoing = None;
+        emit(
+            events,
+            RuntimeEvent::ClipboardTransferChanged {
+                state: ClipboardTransferState::Sending,
+                error: None,
+                updated_at_unix_ms: Some(payload.captured_at_unix_ms),
+            },
+        )
+        .await;
+        let prepared_tx = self.prepared_tx.clone();
+        tokio::spawn(async move {
+            let result = OutgoingClipboardTransfer::prepare(payload)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = prepared_tx.send(result).await;
+        });
+    }
+
+    fn accept_prepared(
+        &mut self,
+        prepared: Result<OutgoingClipboardTransfer, String>,
+    ) -> Result<(), String> {
+        let prepared = prepared?;
+        if self
+            .mailbox
+            .current()
+            .as_ref()
+            .is_some_and(|payload| payload.id == prepared.transfer_id())
+        {
+            self.outgoing = Some(prepared);
+            self.outgoing_started_at = Some(Instant::now());
+            self.outgoing_bytes = 0;
+        }
+        Ok(())
+    }
+
+    fn has_outgoing(&self) -> bool {
+        self.outgoing.is_some()
+    }
+
+    fn finish_outgoing(&mut self) {
+        self.outgoing = None;
+        self.outgoing_started_at = None;
+        self.outgoing_bytes = 0;
+    }
+
+    fn record_outgoing_sent(&mut self, message: &BulkMessage) {
+        match message {
+            BulkMessage::Chunk { data, .. } => {
+                self.outgoing_bytes = self.outgoing_bytes.saturating_add(data.len() as u64);
+            }
+            BulkMessage::Complete { transfer_id } => {
+                log_clipboard_throughput(
+                    "send",
+                    transfer_id,
+                    self.outgoing_bytes,
+                    self.outgoing_started_at,
+                );
+            }
+            BulkMessage::Offer(_) => {}
+        }
+    }
+
+    async fn receive(&mut self, message: BulkMessage) -> Result<Option<ClipboardPayload>, String> {
+        match message {
+            BulkMessage::Offer(offer) => {
+                if offer.reset {
+                    self.incoming_started_at = Some(Instant::now());
+                    self.incoming_bytes = 0;
+                    if self.prune_incoming_before_receive {
+                        crate::clipboard_transfer::prune_incoming_cache(
+                            &self.data_dir,
+                            &std::collections::HashSet::new(),
+                            1,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
+                    self.incoming = Some(
+                        IncomingClipboardTransfer::begin(&self.data_dir, offer)
+                            .await
+                            .map_err(|error| error.to_string())?,
+                    );
+                } else {
+                    self.incoming
+                        .as_mut()
+                        .ok_or_else(|| {
+                            "clipboard manifest continuation has no transfer".to_owned()
+                        })?
+                        .append_offer(offer)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(None)
+            }
+            BulkMessage::Chunk {
+                transfer_id,
+                stream_id,
+                offset,
+                data,
+            } => {
+                let incoming = self
+                    .incoming
+                    .as_mut()
+                    .ok_or_else(|| "clipboard chunk has no active transfer".to_owned())?;
+                if incoming.transfer_id() != transfer_id {
+                    return Err("clipboard chunk transfer identity changed".into());
+                }
+                incoming
+                    .write_chunk(stream_id, offset, &data)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.incoming_bytes = self.incoming_bytes.saturating_add(data.len() as u64);
+                Ok(None)
+            }
+            BulkMessage::Complete { transfer_id } => {
+                let incoming = self
+                    .incoming
+                    .take()
+                    .ok_or_else(|| "clipboard completion has no active transfer".to_owned())?;
+                if incoming.transfer_id() != transfer_id {
+                    return Err("clipboard completion transfer identity changed".into());
+                }
+                let payload = incoming
+                    .complete()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                log_clipboard_throughput(
+                    "receive",
+                    &transfer_id,
+                    self.incoming_bytes,
+                    self.incoming_started_at,
+                );
+                self.incoming_started_at = None;
+                self.incoming_bytes = 0;
+                Ok(Some(payload))
+            }
+        }
+    }
+}
+
+fn log_clipboard_throughput(
+    direction: &'static str,
+    transfer_id: &str,
+    bytes: u64,
+    started_at: Option<Instant>,
+) {
+    let elapsed = started_at.map_or(Duration::ZERO, |started_at| started_at.elapsed());
+    let elapsed_ms = elapsed.as_millis().max(1) as u64;
+    let mebibytes_per_second = bytes as f64 / (1024.0 * 1024.0) / (elapsed_ms as f64 / 1_000.0);
+    tracing::info!(
+        component = "clipboard",
+        direction,
+        transfer_id,
+        bytes,
+        elapsed_ms,
+        mebibytes_per_second,
+        "clipboard bulk transfer summary"
+    );
+}
+
+async fn run_clipboard_worker(
+    mut bulk: BulkChannel,
+    mailbox: ClipboardMailbox,
+    data_dir: std::path::PathBuf,
+    prune_incoming_before_receive: bool,
+    history: Option<ClipboardHistoryStore>,
+    mut updates: mpsc::Receiver<()>,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> Result<(), String> {
+    let mut session = ClipboardSession::new(mailbox, data_dir, prune_incoming_before_receive);
+    session.request_current(&events).await;
+    loop {
+        tokio::select! {
+            update = updates.recv() => {
+                if update.is_none() {
+                    return Ok(());
+                }
+                session.request_current(&events).await;
+            }
+            prepared = session.prepared_rx.recv() => {
+                if let Some(prepared) = prepared
+                    && let Err(error) = session.accept_prepared(prepared)
+                {
+                    emit(&events, RuntimeEvent::ClipboardTransferChanged {
+                        state: ClipboardTransferState::Failed,
+                        error: Some(error),
+                        updated_at_unix_ms: None,
+                    }).await;
+                }
+            }
+            message = bulk.receive() => {
+                let message = message.map_err(|error| error.to_string())?;
+                let receiving_started =
+                    matches!(&message, BulkMessage::Offer(offer) if offer.reset);
+                if receiving_started {
+                    emit(&events, RuntimeEvent::ClipboardTransferChanged {
+                        state: ClipboardTransferState::Receiving,
+                        error: None,
+                        updated_at_unix_ms: None,
+                    }).await;
+                }
+                match session.receive(message).await {
+                    Ok(Some(payload)) => {
+                        let updated_at_unix_ms = payload.captured_at_unix_ms;
+                        if let Some(history) = history.as_ref() {
+                            record_clipboard_payload(&payload, history, &events).await;
+                        }
+                        emit(&events, RuntimeEvent::ClipboardReceived(payload)).await;
+                        emit(&events, RuntimeEvent::ClipboardTransferChanged {
+                            state: ClipboardTransferState::Idle,
+                            error: None,
+                            updated_at_unix_ms: Some(updated_at_unix_ms),
+                        }).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        emit(&events, RuntimeEvent::ClipboardTransferChanged {
+                            state: ClipboardTransferState::Failed,
+                            error: Some(error.clone()),
+                            updated_at_unix_ms: None,
+                        }).await;
+                        return Err(error);
+                    }
+                }
+            }
+            outgoing_message = async {
+                session
+                    .outgoing
+                    .as_mut()
+                    .expect("outgoing clipboard checked")
+                    .next_message()
+                    .await
+                    .map_err(|error| error.to_string())
+            }, if session.has_outgoing() => {
+                match outgoing_message {
+                    Ok(Some(message)) => {
+                        let completed = matches!(&message, BulkMessage::Complete { .. });
+                        bulk.send(&message).await.map_err(|error| error.to_string())?;
+                        session.record_outgoing_sent(&message);
+                        if completed {
+                            session.finish_outgoing();
+                            emit(&events, RuntimeEvent::ClipboardTransferChanged {
+                                state: ClipboardTransferState::Idle,
+                                error: None,
+                                updated_at_unix_ms: None,
+                            }).await;
+                        }
+                    }
+                    Ok(None) => session.finish_outgoing(),
+                    Err(error) => {
+                        session.finish_outgoing();
+                        emit(&events, RuntimeEvent::ClipboardTransferChanged {
+                            state: ClipboardTransferState::Failed,
+                            error: Some(error),
+                            updated_at_unix_ms: None,
+                        }).await;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -221,8 +636,10 @@ fn clears_pending_mouse_movement(command: &RuntimeCommand) -> bool {
             | RuntimeCommand::EnterControl { .. }
             | RuntimeCommand::ReturnControl { .. }
             | RuntimeCommand::ReleaseAll
+            | RuntimeCommand::RecoverNow(_)
             | RuntimeCommand::Disconnect
             | RuntimeCommand::Shutdown
+            | RuntimeCommand::SetControlEnabled(false)
             | RuntimeCommand::SetLocalPolicy(LocalControlPolicy::Paused)
     )
 }
@@ -231,12 +648,19 @@ fn clears_pending_mouse_movement(command: &RuntimeCommand) -> bool {
 struct PendingMouseMovement {
     dx: i64,
     dy: i64,
+    pending_since: Option<Instant>,
 }
 
 impl PendingMouseMovement {
     fn push(&mut self, dx: i32, dy: i32) {
+        if self.is_empty() {
+            self.pending_since = Some(Instant::now());
+        }
         self.dx = self.dx.saturating_add(i64::from(dx));
         self.dy = self.dy.saturating_add(i64::from(dy));
+        if self.is_empty() {
+            self.pending_since = None;
+        }
     }
 
     fn take_chunk(&mut self) -> Option<InputEvent> {
@@ -244,6 +668,9 @@ impl PendingMouseMovement {
         let dy = self.dy.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         self.dx -= i64::from(dx);
         self.dy -= i64::from(dy);
+        if self.is_empty() {
+            self.pending_since = None;
+        }
         (dx != 0 || dy != 0).then_some(InputEvent::MouseMove { dx, dy })
     }
 
@@ -254,6 +681,7 @@ impl PendingMouseMovement {
     fn clear(&mut self) {
         self.dx = 0;
         self.dy = 0;
+        self.pending_since = None;
     }
 }
 
@@ -261,6 +689,9 @@ impl PendingMouseMovement {
 struct MouseMovementState {
     pending: Mutex<PendingMouseMovement>,
     notify: Notify,
+    captured_events: AtomicU64,
+    emitted_events: AtomicU64,
+    max_pending_age_us: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -273,7 +704,10 @@ impl MouseMovementSender {
         if dx == 0 && dy == 0 {
             return;
         }
-        self.with_pending(|pending| pending.push(dx, dy));
+        self.with_pending(|pending| {
+            pending.push(dx, dy);
+            self.state.captured_events.fetch_add(1, Ordering::Relaxed);
+        });
         self.state.notify.notify_one();
     }
 
@@ -334,6 +768,21 @@ impl MouseMovementReceiver {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pending.clear();
+        let captured_events = self.state.captured_events.swap(0, Ordering::Relaxed);
+        let emitted_events = self.state.emitted_events.swap(0, Ordering::Relaxed);
+        let max_pending_age_us = self.state.max_pending_age_us.swap(0, Ordering::Relaxed);
+        if captured_events > 0 {
+            tracing::info!(
+                component = "input",
+                stage = "windows_transport",
+                captured_events,
+                emitted_events,
+                coalesced_events = captured_events.saturating_sub(emitted_events),
+                max_pending_age_us,
+                flush_interval_ms = MOUSE_MOVEMENT_FLUSH_INTERVAL.as_millis(),
+                "Windows mouse movement transport summary"
+            );
+        }
         self.last_emitted_at = None;
         self.activation_logged = false;
     }
@@ -353,7 +802,19 @@ impl MouseMovementReceiver {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending.take_chunk()
+        let pending_since = pending.pending_since;
+        let event = pending.take_chunk();
+        if event.is_some() {
+            self.state.emitted_events.fetch_add(1, Ordering::Relaxed);
+            let pending_age_us = pending_since
+                .map(|started_at| started_at.elapsed().as_micros())
+                .unwrap_or_default()
+                .min(u128::from(u64::MAX)) as u64;
+            self.state
+                .max_pending_age_us
+                .fetch_max(pending_age_us, Ordering::Relaxed);
+        }
+        event
     }
 }
 
@@ -377,10 +838,21 @@ async fn run_windows_runtime(
     mut config: WindowsRuntimeConfig,
     mut commands: mpsc::Receiver<RuntimeCommand>,
     mut mouse_movement: MouseMovementReceiver,
+    clipboard: ClipboardMailbox,
     events: mpsc::Sender<RuntimeEvent>,
 ) {
     let mut attempt_id = 0_u64;
     let mut failure_count = 0_u32;
+    let history = ClipboardHistoryStore::new(store.data_dir());
+    if let Err(error) = history.prune_incoming_cache().await {
+        emit_clipboard_history_error(&events, error).await;
+    }
+    let services = WindowsRuntimeServices {
+        store: &store,
+        clipboard: &clipboard,
+        history: &history,
+        events: &events,
+    };
     emit(
         &events,
         RuntimeEvent::TrustedPeerLoaded {
@@ -393,10 +865,24 @@ async fn run_windows_runtime(
         RuntimeEvent::ScreenEdgeChanged { edge: config.edge },
     )
     .await;
+    emit(
+        &events,
+        RuntimeEvent::ControlEnabledChanged {
+            enabled: config.control_enabled,
+        },
+    )
+    .await;
+    emit(
+        &events,
+        RuntimeEvent::GameModeEnabledChanged {
+            enabled: config.game_mode_enabled,
+        },
+    )
+    .await;
+    publish_clipboard_history(&history, &events).await;
 
     loop {
-        let Some(endpoint) =
-            wait_for_windows_endpoint(&mut config, &store, &mut commands, &events).await
+        let Some(endpoint) = wait_for_windows_endpoint(&mut config, &mut commands, &services).await
         else {
             return;
         };
@@ -423,7 +909,7 @@ async fn run_windows_runtime(
                     },
                 )
                 .await;
-                if !windows_backoff(&mut config, &store, &mut commands, &events).await {
+                if !windows_backoff(&mut config, &mut commands, &services).await {
                     return;
                 }
                 continue;
@@ -439,7 +925,7 @@ async fn run_windows_runtime(
             Ok(Err(error)) => {
                 failure_count = failure_count.saturating_add(1);
                 emit_connection_failure(&events, attempt_id, failure_count, error).await;
-                if !windows_backoff(&mut config, &store, &mut commands, &events).await {
+                if !windows_backoff(&mut config, &mut commands, &services).await {
                     return;
                 }
                 continue;
@@ -455,7 +941,7 @@ async fn run_windows_runtime(
                     },
                 )
                 .await;
-                if !windows_backoff(&mut config, &store, &mut commands, &events).await {
+                if !windows_backoff(&mut config, &mut commands, &services).await {
                     return;
                 }
                 continue;
@@ -465,12 +951,15 @@ async fn run_windows_runtime(
 
         let outcome = prepare_windows_channel(
             channel,
-            endpoint.clone(),
-            &store,
+            WindowsConnectionContext {
+                address,
+                identity: &identity,
+                endpoint: endpoint.clone(),
+            },
             &mut config,
             &mut commands,
             &mut mouse_movement,
-            &events,
+            &services,
         )
         .await;
         mouse_movement.clear();
@@ -484,9 +973,19 @@ async fn run_windows_runtime(
                     },
                 )
                 .await;
-                if !windows_backoff(&mut config, &store, &mut commands, &events).await {
+                if !windows_backoff(&mut config, &mut commands, &services).await {
                     return;
                 }
+            }
+            ChannelOutcome::ReconnectNow(reason) => {
+                emit(
+                    &events,
+                    RuntimeEvent::Offline {
+                        reason,
+                        retrying: true,
+                    },
+                )
+                .await;
             }
             ChannelOutcome::Reconfigure(endpoint) => {
                 config.endpoint = Some(endpoint);
@@ -501,10 +1000,15 @@ async fn run_windows_runtime(
 
 async fn wait_for_windows_endpoint(
     config: &mut WindowsRuntimeConfig,
-    store: &ConfigStore,
     commands: &mut mpsc::Receiver<RuntimeCommand>,
-    events: &mpsc::Sender<RuntimeEvent>,
+    services: &WindowsRuntimeServices<'_>,
 ) -> Option<NetworkEndpoint> {
+    let WindowsRuntimeServices {
+        store,
+        clipboard,
+        history,
+        events,
+    } = services;
     if let Some(endpoint) = config.endpoint.clone() {
         return Some(endpoint);
     }
@@ -532,6 +1036,27 @@ async fn wait_for_windows_endpoint(
             RuntimeCommand::ConfigureScreenEdge(edge) => {
                 update_windows_edge(config, store, edge, events).await;
             }
+            RuntimeCommand::ConfigureTargetDisplay(display_id) => {
+                update_windows_target_display(config, store, display_id, events).await;
+            }
+            RuntimeCommand::SetControlEnabled(enabled) => {
+                update_windows_control_enabled(config, store, enabled, events).await;
+            }
+            RuntimeCommand::SetGameModeEnabled(enabled) => {
+                update_windows_game_mode_enabled(config, store, enabled, events).await;
+            }
+            RuntimeCommand::ClipboardUpdated => {
+                record_current_clipboard(clipboard, history, events).await;
+            }
+            RuntimeCommand::ActivateClipboardHistory(id) => {
+                activate_clipboard_history(&id, clipboard, history, events).await;
+            }
+            RuntimeCommand::ClearClipboardHistory => {
+                clear_clipboard_history(history, events).await;
+            }
+            RuntimeCommand::RecoverNow(trigger) => {
+                emit_recovery_trigger(events, trigger).await;
+            }
             RuntimeCommand::Shutdown => return None,
             _ => {}
         }
@@ -540,10 +1065,15 @@ async fn wait_for_windows_endpoint(
 
 async fn windows_backoff(
     config: &mut WindowsRuntimeConfig,
-    store: &ConfigStore,
     commands: &mut mpsc::Receiver<RuntimeCommand>,
-    events: &mpsc::Sender<RuntimeEvent>,
+    services: &WindowsRuntimeServices<'_>,
 ) -> bool {
+    let WindowsRuntimeServices {
+        store,
+        clipboard,
+        history,
+        events,
+    } = services;
     let delay = tokio::time::sleep(RECONNECT_INTERVAL);
     tokio::pin!(delay);
     loop {
@@ -565,6 +1095,28 @@ async fn windows_backoff(
                     Some(RuntimeCommand::ConfigureScreenEdge(edge)) => {
                         update_windows_edge(config, store, edge, events).await;
                     }
+                    Some(RuntimeCommand::ConfigureTargetDisplay(display_id)) => {
+                        update_windows_target_display(config, store, display_id, events).await;
+                    }
+                    Some(RuntimeCommand::SetControlEnabled(enabled)) => {
+                        update_windows_control_enabled(config, store, enabled, events).await;
+                    }
+                    Some(RuntimeCommand::SetGameModeEnabled(enabled)) => {
+                        update_windows_game_mode_enabled(config, store, enabled, events).await;
+                    }
+                    Some(RuntimeCommand::ClipboardUpdated) => {
+                        record_current_clipboard(clipboard, history, events).await;
+                    }
+                    Some(RuntimeCommand::ActivateClipboardHistory(id)) => {
+                        activate_clipboard_history(&id, clipboard, history, events).await;
+                    }
+                    Some(RuntimeCommand::ClearClipboardHistory) => {
+                        clear_clipboard_history(history, events).await;
+                    }
+                    Some(RuntimeCommand::RecoverNow(trigger)) => {
+                        emit_recovery_trigger(events, trigger).await;
+                        return true;
+                    }
                     Some(RuntimeCommand::Shutdown) | None => return false,
                     Some(RuntimeCommand::Disconnect) => {
                         config.endpoint = None;
@@ -578,6 +1130,77 @@ async fn windows_backoff(
             }
         }
     }
+}
+
+async fn publish_clipboard_history(
+    history: &ClipboardHistoryStore,
+    events: &mpsc::Sender<RuntimeEvent>,
+) {
+    match history.summaries().await {
+        Ok(items) => emit(events, RuntimeEvent::ClipboardHistoryChanged(items)).await,
+        Err(error) => emit_clipboard_history_error(events, error).await,
+    }
+}
+
+async fn record_current_clipboard(
+    clipboard: &ClipboardMailbox,
+    history: &ClipboardHistoryStore,
+    events: &mpsc::Sender<RuntimeEvent>,
+) {
+    if let Some(payload) = clipboard.current() {
+        record_clipboard_payload(&payload, history, events).await;
+    }
+}
+
+async fn record_clipboard_payload(
+    payload: &ClipboardPayload,
+    history: &ClipboardHistoryStore,
+    events: &mpsc::Sender<RuntimeEvent>,
+) {
+    match history.record(payload).await {
+        Ok(items) => emit(events, RuntimeEvent::ClipboardHistoryChanged(items)).await,
+        Err(error) => emit_clipboard_history_error(events, error).await,
+    }
+}
+
+async fn activate_clipboard_history(
+    id: &str,
+    clipboard: &ClipboardMailbox,
+    history: &ClipboardHistoryStore,
+    events: &mpsc::Sender<RuntimeEvent>,
+) {
+    match history.load(id).await {
+        Ok(mut payload) => {
+            payload.id = activated_payload_id();
+            payload.captured_at_unix_ms = unix_time_ms();
+            clipboard.replace(payload.clone());
+            emit(events, RuntimeEvent::ClipboardHistoryActivated(payload)).await;
+        }
+        Err(error) => emit_clipboard_history_error(events, error).await,
+    }
+}
+
+async fn clear_clipboard_history(
+    history: &ClipboardHistoryStore,
+    events: &mpsc::Sender<RuntimeEvent>,
+) {
+    match history.clear().await {
+        Ok(()) => emit(events, RuntimeEvent::ClipboardHistoryChanged(Vec::new())).await,
+        Err(error) => emit_clipboard_history_error(events, error).await,
+    }
+}
+
+async fn emit_clipboard_history_error(
+    events: &mpsc::Sender<RuntimeEvent>,
+    error: impl std::fmt::Display,
+) {
+    emit(
+        events,
+        RuntimeEvent::RuntimeFailed {
+            message: format!("剪贴板历史操作失败：{error}"),
+        },
+    )
+    .await;
 }
 
 async fn update_windows_edge(
@@ -602,15 +1225,92 @@ async fn update_windows_edge(
     emit(events, RuntimeEvent::ConfigUpdated).await;
 }
 
+async fn update_windows_target_display(
+    config: &mut WindowsRuntimeConfig,
+    store: &ConfigStore,
+    display_id: String,
+    events: &mpsc::Sender<RuntimeEvent>,
+) {
+    if display_id.trim().is_empty()
+        || config.target_display_id.as_deref() == Some(display_id.as_str())
+    {
+        return;
+    }
+    let previous = config.target_display_id.replace(display_id);
+    if let Err(error) = store.save_windows(config) {
+        config.target_display_id = previous;
+        emit_runtime_failed(events, error).await;
+        return;
+    }
+    emit(events, RuntimeEvent::ConfigUpdated).await;
+}
+
+async fn update_windows_control_enabled(
+    config: &mut WindowsRuntimeConfig,
+    store: &ConfigStore,
+    enabled: bool,
+    events: &mpsc::Sender<RuntimeEvent>,
+) {
+    if config.control_enabled == enabled {
+        emit(events, RuntimeEvent::ControlEnabledChanged { enabled }).await;
+        return;
+    }
+    let previous = config.control_enabled;
+    config.control_enabled = enabled;
+    if let Err(error) = store.save_windows(config) {
+        config.control_enabled = previous;
+        emit(
+            events,
+            RuntimeEvent::ControlEnabledChanged { enabled: previous },
+        )
+        .await;
+        emit_runtime_failed(events, error).await;
+        return;
+    }
+    emit(events, RuntimeEvent::ControlEnabledChanged { enabled }).await;
+    emit(events, RuntimeEvent::ConfigUpdated).await;
+}
+
+async fn update_windows_game_mode_enabled(
+    config: &mut WindowsRuntimeConfig,
+    store: &ConfigStore,
+    enabled: bool,
+    events: &mpsc::Sender<RuntimeEvent>,
+) {
+    if config.game_mode_enabled == enabled {
+        emit(events, RuntimeEvent::GameModeEnabledChanged { enabled }).await;
+        return;
+    }
+    let previous = config.game_mode_enabled;
+    config.game_mode_enabled = enabled;
+    if let Err(error) = store.save_windows(config) {
+        config.game_mode_enabled = previous;
+        emit(
+            events,
+            RuntimeEvent::GameModeEnabledChanged { enabled: previous },
+        )
+        .await;
+        emit_runtime_failed(events, error).await;
+        return;
+    }
+    emit(events, RuntimeEvent::GameModeEnabledChanged { enabled }).await;
+    emit(events, RuntimeEvent::ConfigUpdated).await;
+}
+
 async fn prepare_windows_channel(
     mut channel: SecureChannel,
-    endpoint: NetworkEndpoint,
-    store: &ConfigStore,
+    connection: WindowsConnectionContext<'_>,
     config: &mut WindowsRuntimeConfig,
     commands: &mut mpsc::Receiver<RuntimeCommand>,
     mouse_movement: &mut MouseMovementReceiver,
-    events: &mpsc::Sender<RuntimeEvent>,
+    services: &WindowsRuntimeServices<'_>,
 ) -> ChannelOutcome {
+    let WindowsConnectionContext {
+        address,
+        identity,
+        endpoint,
+    } = connection;
+    let WindowsRuntimeServices { store, events, .. } = services;
     let previous_trust = config.trusted_peer.clone();
     if let ChannelTrust::Pairing { code } = channel.trust().clone() {
         let paired = match run_pairing(&mut channel, code, commands, events).await {
@@ -629,6 +1329,16 @@ async fn prepare_windows_channel(
             return ChannelOutcome::Reconnect(error);
         }
     }
+    if let Err(error) = open_channel(&mut channel, ChannelPurpose::Control, None).await {
+        return ChannelOutcome::Reconnect(error);
+    }
+    let Some(trusted_peer) = config.trusted_peer.as_ref() else {
+        return ChannelOutcome::Reconnect("控制通道缺少可信设备信息".into());
+    };
+    let bulk = match connect_windows_bulk_channel(address, identity, trusted_peer, &channel).await {
+        Ok(bulk) => bulk,
+        Err(error) => return ChannelOutcome::Reconnect(error),
+    };
 
     emit(
         events,
@@ -639,18 +1349,35 @@ async fn prepare_windows_channel(
         },
     )
     .await;
-    run_windows_session(channel, config, store, commands, mouse_movement, events).await
+    run_windows_session(channel, bulk, config, commands, mouse_movement, services).await
 }
 
 async fn run_windows_session(
     mut channel: SecureChannel,
+    bulk: BulkChannel,
     config: &mut WindowsRuntimeConfig,
-    store: &ConfigStore,
     commands: &mut mpsc::Receiver<RuntimeCommand>,
     mouse_movement: &mut MouseMovementReceiver,
-    events: &mpsc::Sender<RuntimeEvent>,
+    services: &WindowsRuntimeServices<'_>,
 ) -> ChannelOutcome {
+    let WindowsRuntimeServices {
+        store,
+        clipboard,
+        history,
+        events,
+    } = services;
     mouse_movement.clear();
+    let (clipboard_updates, clipboard_update_rx) = mpsc::channel(8);
+    let clipboard_worker = run_clipboard_worker(
+        bulk,
+        (*clipboard).clone(),
+        store.data_dir().to_owned(),
+        false,
+        Some((*history).clone()),
+        clipboard_update_rx,
+        (*events).clone(),
+    );
+    tokio::pin!(clipboard_worker);
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     heartbeat.tick().await;
@@ -663,12 +1390,14 @@ async fn run_windows_session(
             command = commands.recv() => {
                 match command {
                     Some(RuntimeCommand::EnterControl { edge, position }) => {
+                        mouse_movement.clear();
                         if let Err(error) = channel.send(ProtocolMessage::EnterControl { edge, position }).await {
                             return ChannelOutcome::Reconnect(error.to_string());
                         }
                         control_requested_at = Some(Instant::now());
                     }
                     Some(RuntimeCommand::ReturnControl { position }) => {
+                        mouse_movement.clear();
                         control_requested_at = None;
                         if let Err(error) = channel.send(ProtocolMessage::ReturnControl { position }).await {
                             return ChannelOutcome::Reconnect(error.to_string());
@@ -680,6 +1409,7 @@ async fn run_windows_session(
                         }
                     }
                     Some(RuntimeCommand::ReleaseAll) => {
+                        mouse_movement.clear();
                         let _ = channel.send(ProtocolMessage::ReleaseAll).await;
                     }
                     Some(RuntimeCommand::ConfigureEndpoint(new_endpoint)) => {
@@ -688,6 +1418,33 @@ async fn run_windows_session(
                     }
                     Some(RuntimeCommand::ConfigureScreenEdge(edge)) => {
                         update_windows_edge(config, store, edge, events).await;
+                    }
+                    Some(RuntimeCommand::ConfigureTargetDisplay(display_id)) => {
+                        update_windows_target_display(config, store, display_id, events).await;
+                    }
+                    Some(RuntimeCommand::ClipboardUpdated) => {
+                        record_current_clipboard(clipboard, history, events).await;
+                        let _ = clipboard_updates.try_send(());
+                    }
+                    Some(RuntimeCommand::ActivateClipboardHistory(id)) => {
+                        activate_clipboard_history(&id, clipboard, history, events).await;
+                        let _ = clipboard_updates.try_send(());
+                    }
+                    Some(RuntimeCommand::ClearClipboardHistory) => {
+                        clear_clipboard_history(history, events).await;
+                    }
+                    Some(RuntimeCommand::SetControlEnabled(enabled)) => {
+                        update_windows_control_enabled(config, store, enabled, events).await;
+                    }
+                    Some(RuntimeCommand::SetGameModeEnabled(enabled)) => {
+                        update_windows_game_mode_enabled(config, store, enabled, events).await;
+                    }
+                    Some(RuntimeCommand::RecoverNow(trigger)) => {
+                        emit_recovery_trigger(events, trigger).await;
+                        let _ = channel.send(ProtocolMessage::ReleaseAll).await;
+                        return ChannelOutcome::ReconnectNow(
+                            "网络变化或系统唤醒，正在立即恢复连接".into(),
+                        );
                     }
                     Some(RuntimeCommand::Disconnect) => {
                         let _ = channel.send(ProtocolMessage::ReleaseAll).await;
@@ -754,6 +1511,11 @@ async fn run_windows_session(
                     return ChannelOutcome::Reconnect(error.to_string());
                 }
             }
+            result = &mut clipboard_worker => {
+                return ChannelOutcome::Reconnect(
+                    result.err().unwrap_or_else(|| "剪贴板通道已停止".into())
+                );
+            }
         }
     }
 }
@@ -763,6 +1525,7 @@ async fn run_macos_runtime(
     store: ConfigStore,
     mut config: MacRuntimeConfig,
     mut commands: mpsc::Receiver<RuntimeCommand>,
+    clipboard: ClipboardMailbox,
     events: mpsc::Sender<RuntimeEvent>,
 ) {
     emit(
@@ -824,40 +1587,60 @@ async fn run_macos_runtime(
                         continue;
                     }
                 }
+                Some(RuntimeCommand::RecoverNow(trigger)) => {
+                    emit_recovery_trigger(&events, trigger).await;
+                    let port = config.listen_port;
+                    replace_macos_listener(
+                        &identity,
+                        &store,
+                        &mut config,
+                        &mut listener,
+                        port,
+                        &events,
+                    )
+                    .await;
+                }
                 Some(RuntimeCommand::Shutdown) | None => return,
                 _ => {}
             }
             continue;
         }
 
-        let active_listener = listener.as_ref().expect("listener checked");
         tokio::select! {
-            accepted = active_listener.accept() => {
+            accepted = async {
+                listener
+                    .as_ref()
+                    .expect("listener checked")
+                    .accept()
+                    .await
+            } => {
                 match accepted {
                     Ok((channel, remote_addr)) => {
                         let endpoint = NetworkEndpoint {
                             ip: remote_addr.ip().to_string(),
                             port: remote_addr.port(),
                         };
-                        let previous_trust = config.trusted_peer.clone();
+                        let services = MacChannelServices {
+                            listener: listener.as_mut().expect("listener checked"),
+                            store: &store,
+                            clipboard: &clipboard,
+                            events: &events,
+                        };
                         match prepare_macos_channel(
                             channel,
                             endpoint,
-                            &store,
                             &mut config,
                             &mut commands,
-                            &events,
+                            services,
                         ).await {
                             ChannelOutcome::Reconnect(reason) => {
                                 emit(&events, RuntimeEvent::Offline { reason, retrying: false }).await;
                             }
+                            ChannelOutcome::ReconnectNow(reason) => {
+                                emit(&events, RuntimeEvent::Offline { reason, retrying: false }).await;
+                            }
                             ChannelOutcome::Reconfigure(_) => {}
                             ChannelOutcome::Shutdown => return,
-                        }
-                        if config.trusted_peer != previous_trust
-                            && let Some(listener) = listener.as_mut()
-                        {
-                            listener.set_trusted_peer(config.trusted_peer.clone());
                         }
                     }
                     Err(error) => {
@@ -885,6 +1668,22 @@ async fn run_macos_runtime(
                             emit(&events, RuntimeEvent::ConfigUpdated).await;
                             emit(&events, RuntimeEvent::LocalPolicyChanged { policy }).await;
                         }
+                    }
+                    Some(RuntimeCommand::RecoverNow(trigger)) => {
+                        emit_recovery_trigger(&events, trigger).await;
+                        emit(
+                            &events,
+                            RuntimeEvent::ListenerStarted {
+                                ip: local_ipv4_address(),
+                                port: listener
+                                    .as_ref()
+                                    .expect("listener checked")
+                                    .local_addr()
+                                    .map(|address| address.port())
+                                    .unwrap_or(config.listen_port),
+                            },
+                        )
+                        .await;
                     }
                     Some(RuntimeCommand::Shutdown) | None => return,
                     _ => {}
@@ -972,11 +1771,16 @@ async fn replace_macos_listener(
 async fn prepare_macos_channel(
     mut channel: SecureChannel,
     endpoint: NetworkEndpoint,
-    store: &ConfigStore,
     config: &mut MacRuntimeConfig,
     commands: &mut mpsc::Receiver<RuntimeCommand>,
-    events: &mpsc::Sender<RuntimeEvent>,
+    services: MacChannelServices<'_>,
 ) -> ChannelOutcome {
+    let MacChannelServices {
+        listener,
+        store,
+        clipboard,
+        events,
+    } = services;
     let previous_trust = config.trusted_peer.clone();
     if let ChannelTrust::Pairing { code } = channel.trust().clone() {
         let paired = match run_pairing(&mut channel, code, commands, events).await {
@@ -994,7 +1798,15 @@ async fn prepare_macos_channel(
             let _ = store.save_macos(config);
             return ChannelOutcome::Reconnect(error);
         }
+        listener.set_trusted_peer(config.trusted_peer.clone());
     }
+    if let Err(error) = accept_channel(&mut channel, ChannelPurpose::Control, None).await {
+        return ChannelOutcome::Reconnect(error);
+    }
+    let bulk = match accept_macos_bulk_channel(listener, &channel).await {
+        Ok(bulk) => bulk,
+        Err(error) => return ChannelOutcome::Reconnect(error),
+    };
 
     emit(
         events,
@@ -1005,16 +1817,38 @@ async fn prepare_macos_channel(
         },
     )
     .await;
-    run_macos_session(channel, config, store, commands, events).await
+    run_macos_session(channel, bulk, config, store, commands, clipboard, events).await
 }
 
 async fn run_macos_session(
     mut channel: SecureChannel,
+    bulk: BulkChannel,
     config: &mut MacRuntimeConfig,
     store: &ConfigStore,
     commands: &mut mpsc::Receiver<RuntimeCommand>,
+    clipboard: &ClipboardMailbox,
     events: &mpsc::Sender<RuntimeEvent>,
 ) -> ChannelOutcome {
+    if let Err(error) = channel
+        .send(ProtocolMessage::RemotePause {
+            paused: config.local_policy == LocalControlPolicy::Paused,
+        })
+        .await
+    {
+        return ChannelOutcome::Reconnect(error.to_string());
+    }
+    let (clipboard_updates, clipboard_update_rx) = mpsc::channel(8);
+    let clipboard_worker = run_clipboard_worker(
+        bulk,
+        clipboard.clone(),
+        store.data_dir().to_owned(),
+        true,
+        None,
+        clipboard_update_rx,
+        events.clone(),
+    );
+    tokio::pin!(clipboard_worker);
+
     loop {
         tokio::select! {
             message = channel.receive() => {
@@ -1081,6 +1915,17 @@ async fn run_macos_session(
                             return ChannelOutcome::Reconnect(error.to_string());
                         }
                     }
+                    Some(RuntimeCommand::ClipboardUpdated) => {
+                        let _ = clipboard_updates.try_send(());
+                    }
+                    Some(RuntimeCommand::RecoverNow(trigger)) => {
+                        emit_recovery_trigger(events, trigger).await;
+                        emit(events, RuntimeEvent::ReleaseAllRequested).await;
+                        let _ = channel.send(ProtocolMessage::ReleaseAll).await;
+                        return ChannelOutcome::ReconnectNow(
+                            "网络变化或系统唤醒，正在恢复监听".into(),
+                        );
+                    }
                     Some(RuntimeCommand::ConfigureListenPort(_)) => {
                         emit(events, RuntimeEvent::RuntimeFailed {
                             message: "活动会话期间不能修改监听端口".into(),
@@ -1098,6 +1943,11 @@ async fn run_macos_session(
                     }
                     _ => {}
                 }
+            }
+            result = &mut clipboard_worker => {
+                return ChannelOutcome::Reconnect(
+                    result.err().unwrap_or_else(|| "剪贴板通道已停止".into())
+                );
             }
         }
     }
@@ -1172,6 +2022,13 @@ async fn run_pairing(
                         emit(events, RuntimeEvent::PairingRejected { local: true }).await;
                         return Err(ChannelOutcome::Reconnect("本机拒绝配对".into()));
                     }
+                    Some(RuntimeCommand::RecoverNow(trigger)) => {
+                        emit_recovery_trigger(events, trigger).await;
+                        let _ = channel.send(ProtocolMessage::PairingDecision { confirmed: false }).await;
+                        return Err(ChannelOutcome::ReconnectNow(
+                            "网络变化或系统唤醒，配对会话已重新开始".into(),
+                        ));
+                    }
                     Some(RuntimeCommand::Shutdown) | None => {
                         let _ = channel.send(ProtocolMessage::PairingDecision { confirmed: false }).await;
                         return Err(ChannelOutcome::Shutdown);
@@ -1195,6 +2052,98 @@ async fn exchange_session_ready(channel: &mut SecureChannel) -> Result<(), Strin
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err("等待远端进入会话超时".into()),
     }
+}
+
+async fn open_channel(
+    channel: &mut SecureChannel,
+    purpose: ChannelPurpose,
+    control_session_id: Option<String>,
+) -> Result<(), String> {
+    channel
+        .send(ProtocolMessage::OpenChannel {
+            purpose,
+            control_session_id,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    match tokio::time::timeout(CONNECT_TIMEOUT, channel.receive()).await {
+        Ok(Ok(ProtocolMessage::ChannelReady {
+            purpose: remote_purpose,
+        })) if remote_purpose == purpose => Ok(()),
+        Ok(Ok(_)) => Err("通道建立时收到意外消息".into()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("等待远端建立通道超时".into()),
+    }
+}
+
+async fn accept_channel(
+    channel: &mut SecureChannel,
+    purpose: ChannelPurpose,
+    control_session_id: Option<&str>,
+) -> Result<(), String> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, channel.receive()).await {
+        Ok(Ok(ProtocolMessage::OpenChannel {
+            purpose: remote_purpose,
+            control_session_id: remote_control_session_id,
+        })) if remote_purpose == purpose
+            && remote_control_session_id.as_deref() == control_session_id => {}
+        Ok(Ok(_)) => return Err("远端请求了无效通道".into()),
+        Ok(Err(error)) => return Err(error.to_string()),
+        Err(_) => return Err("等待远端声明通道用途超时".into()),
+    }
+    channel
+        .send(ProtocolMessage::ChannelReady { purpose })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn connect_windows_bulk_channel(
+    address: SocketAddr,
+    identity: &DeviceIdentity,
+    trusted_peer: &TrustedPeer,
+    control_channel: &SecureChannel,
+) -> Result<BulkChannel, String> {
+    let mut channel = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect(address, identity, Some(trusted_peer)),
+    )
+    .await
+    .map_err(|_| "连接 Mac 剪贴板通道超时".to_owned())?
+    .map_err(|error| error.to_string())?;
+    if channel.trust() != &ChannelTrust::Authenticated
+        || channel.peer().device_id != control_channel.peer().device_id
+    {
+        return Err("剪贴板通道设备身份不匹配".into());
+    }
+    open_channel(
+        &mut channel,
+        ChannelPurpose::Clipboard,
+        Some(control_channel.session_id().to_owned()),
+    )
+    .await?;
+    Ok(BulkChannel::from_secure(channel))
+}
+
+async fn accept_macos_bulk_channel(
+    listener: &SecureListener,
+    control_channel: &SecureChannel,
+) -> Result<BulkChannel, String> {
+    let (mut channel, _) = tokio::time::timeout(CONNECT_TIMEOUT, listener.accept())
+        .await
+        .map_err(|_| "等待 Windows 剪贴板通道超时".to_owned())?
+        .map_err(|error| error.to_string())?;
+    if channel.trust() != &ChannelTrust::Authenticated
+        || channel.peer().device_id != control_channel.peer().device_id
+    {
+        return Err("剪贴板通道设备身份不匹配".into());
+    }
+    accept_channel(
+        &mut channel,
+        ChannelPurpose::Clipboard,
+        Some(control_channel.session_id()),
+    )
+    .await?;
+    Ok(BulkChannel::from_secure(channel))
 }
 
 fn endpoint_to_socket_addr(endpoint: &NetworkEndpoint) -> Result<SocketAddr, String> {
@@ -1256,7 +2205,6 @@ fn interface_ipv4_score(candidate: &InterfaceIpv4Candidate) -> Option<u16> {
     Some(score)
 }
 
-#[cfg(target_os = "macos")]
 fn local_ipv4_candidates() -> Vec<InterfaceIpv4Candidate> {
     if_addrs::get_if_addrs()
         .unwrap_or_default()
@@ -1267,11 +2215,7 @@ fn local_ipv4_candidates() -> Vec<InterfaceIpv4Candidate> {
                 return None;
             };
             let name = interface.name;
-            let is_virtual = [
-                "utun", "tun", "tap", "ppp", "ipsec", "gif", "stf", "awdl", "llw",
-            ]
-            .iter()
-            .any(|prefix| name.starts_with(prefix));
+            let is_virtual = is_virtual_interface_name(&name);
             Some(InterfaceIpv4Candidate {
                 is_up,
                 is_loopback: address.ip.is_loopback(),
@@ -1283,9 +2227,74 @@ fn local_ipv4_candidates() -> Vec<InterfaceIpv4Candidate> {
         .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
-fn local_ipv4_candidates() -> Vec<InterfaceIpv4Candidate> {
-    Vec::new()
+fn is_virtual_interface_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "utun",
+        "tun",
+        "tap",
+        "ppp",
+        "ipsec",
+        "gif",
+        "stf",
+        "awdl",
+        "llw",
+        "vethernet",
+        "virtual",
+        "vmware",
+        "hyper-v",
+        "tailscale",
+        "wireguard",
+        "tunnel",
+        "loopback",
+    ]
+    .iter()
+    .any(|marker| name.contains(marker))
+}
+
+fn network_signature() -> Vec<Ipv4Addr> {
+    let mut addresses: Vec<_> = local_ipv4_candidates()
+        .into_iter()
+        .filter(|candidate| interface_ipv4_score(candidate).is_some())
+        .map(|candidate| candidate.address)
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+fn spawn_network_change_watcher(commands: mpsc::Sender<RuntimeCommand>) {
+    tokio::spawn(async move {
+        let mut previous = network_signature();
+        let mut poll = tokio::time::interval(NETWORK_CHANGE_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        poll.tick().await;
+        loop {
+            poll.tick().await;
+            if commands.is_closed() {
+                return;
+            }
+            let current = network_signature();
+            if current == previous {
+                continue;
+            }
+            let network_available = !current.is_empty();
+            tracing::info!(
+                component = "connection",
+                network_available,
+                "local network interface state changed"
+            );
+            previous = current;
+            if network_available
+                && commands
+                    .send(RuntimeCommand::RecoverNow(RecoveryTrigger::NetworkChanged))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+    });
 }
 
 async fn emit(events: &mpsc::Sender<RuntimeEvent>, event: RuntimeEvent) {
@@ -1309,6 +2318,11 @@ async fn emit_connection_failure(
     .await;
 }
 
+async fn emit_recovery_trigger(events: &mpsc::Sender<RuntimeEvent>, trigger: RecoveryTrigger) {
+    tracing::info!(component = "connection", ?trigger, "KVM recovery triggered");
+    emit(events, RuntimeEvent::RecoveryTriggered { trigger }).await;
+}
+
 async fn emit_runtime_failed(events: &mpsc::Sender<RuntimeEvent>, error: impl std::fmt::Display) {
     emit(
         events,
@@ -1330,6 +2344,7 @@ fn unix_time_ms() -> u64 {
 
 enum ChannelOutcome {
     Reconnect(String),
+    ReconnectNow(String),
     Reconfigure(NetworkEndpoint),
     Shutdown,
 }
@@ -1338,6 +2353,56 @@ enum ChannelOutcome {
 mod tests {
     use super::*;
     use kvmflow_domain::{KeyAction, KeyUsage};
+
+    #[tokio::test]
+    async fn selected_windows_display_is_persisted() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let store = ConfigStore::new(directory.path());
+        let mut config = WindowsRuntimeConfig::default();
+        let (events, mut received_events) = mpsc::channel(4);
+
+        update_windows_target_display(&mut config, &store, r"\\.\DISPLAY2".into(), &events).await;
+
+        assert_eq!(config.target_display_id.as_deref(), Some(r"\\.\DISPLAY2"));
+        assert_eq!(
+            store
+                .load_windows()
+                .expect("persisted Windows config")
+                .target_display_id
+                .as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+        assert!(matches!(
+            received_events.recv().await,
+            Some(RuntimeEvent::ConfigUpdated)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_command_skips_the_remaining_windows_backoff() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let store = ConfigStore::new(directory.path());
+        let mut config = WindowsRuntimeConfig::default();
+        let clipboard = ClipboardMailbox::default();
+        let history = ClipboardHistoryStore::new(store.data_dir());
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let (events, _received_events) = mpsc::channel(1);
+        let services = WindowsRuntimeServices {
+            store: &store,
+            clipboard: &clipboard,
+            history: &history,
+            events: &events,
+        };
+
+        command_tx
+            .send(RuntimeCommand::RecoverNow(RecoveryTrigger::SystemResumed))
+            .await
+            .expect("queue immediate recovery");
+
+        let started_at = Instant::now();
+        assert!(windows_backoff(&mut config, &mut commands, &services).await);
+        assert_eq!(Instant::now(), started_at);
+    }
 
     #[test]
     fn pending_mouse_movement_preserves_the_accumulated_delta() {
@@ -1385,6 +2450,7 @@ mod tests {
         let handle = RuntimeHandle {
             command_tx,
             mouse_movement: Some(mouse_movement_tx),
+            clipboard: ClipboardMailbox::default(),
         };
 
         handle
@@ -1409,6 +2475,20 @@ mod tests {
         assert_eq!(
             mouse_movement_rx.receive().await,
             InputEvent::MouseMove { dx: 10, dy: 3 }
+        );
+        assert_eq!(
+            mouse_movement_rx
+                .state
+                .captured_events
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            mouse_movement_rx
+                .state
+                .emitted_events
+                .load(Ordering::Relaxed),
+            1
         );
 
         let key = InputEvent::Key {
@@ -1455,6 +2535,7 @@ mod tests {
         let handle = RuntimeHandle {
             command_tx,
             mouse_movement: Some(mouse_movement_tx),
+            clipboard: ClipboardMailbox::default(),
         };
         drop(commands);
 
@@ -1507,6 +2588,21 @@ mod tests {
             interface_ipv4_score(&physical).expect("physical score")
                 > interface_ipv4_score(&secondary).expect("secondary score")
         );
+    }
+
+    #[test]
+    fn virtual_interface_names_are_excluded_from_recovery_signatures() {
+        for name in [
+            "utun4",
+            "vEthernet (WSL)",
+            "Tailscale",
+            "VMware Network Adapter",
+        ] {
+            assert!(is_virtual_interface_name(name), "{name}");
+        }
+        for name in ["en0", "Ethernet", "Wi-Fi", "wlan0"] {
+            assert!(!is_virtual_interface_name(name), "{name}");
+        }
     }
 
     #[cfg(target_os = "macos")]

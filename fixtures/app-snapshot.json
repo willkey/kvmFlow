@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 6,
   "role": "windowsController",
   "phase": "running",
   "windowState": "open",
@@ -15,7 +15,23 @@
     "validCpuSampleCount": 0,
     "peakMemoryBytes": null,
     "averageCpuPercent": null,
-    "peakCpuPercent": null
+    "peakCpuPercent": null,
+    "kvm": {
+      "successfulEntries": 0,
+      "successfulReturns": 0,
+      "transitionFailures": 0,
+      "emergencyReturns": 0,
+      "emergencyReturnSampleCount": 0,
+      "peakEmergencyReturnMs": null,
+      "disconnects": 0,
+      "reconnects": 0,
+      "networkRecoveries": 0,
+      "wakeRecoveries": 0,
+      "latencySampleCount": 0,
+      "averageLatencyMs": null,
+      "p95LatencyMs": null,
+      "peakLatencyMs": null
+    }
   },
   "kvm": {
     "trust": "unpaired",
@@ -23,12 +39,24 @@
     "control": "local",
     "permission": "unknown",
     "localPolicy": "allowed",
+    "controlEnabled": true,
+    "gameModeEnabled": true,
+    "foregroundFullscreen": false,
+    "remoteControlAvailable": true,
+    "clipboard": {
+      "transferState": "idle",
+      "lastError": null,
+      "lastUpdatedUnixMs": null,
+      "history": []
+    },
     "screenEdge": "bottom",
+    "targetDisplayId": null,
     "endpoint": null,
     "peerDeviceName": null,
     "pairing": null,
     "latencyMs": null,
     "sessionId": null,
+    "consecutiveFailures": 0,
     "lastError": null
   }
 }

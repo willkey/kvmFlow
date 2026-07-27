@@ -14,6 +14,11 @@ impl KeyUsage {
     pub const SPACE: Self = Self(0x2c);
     pub const CAPS_LOCK: Self = Self(0x39);
     pub const F12: Self = Self(0x45);
+    pub const HOME: Self = Self(0x4a);
+    pub const PAGE_UP: Self = Self(0x4b);
+    pub const FORWARD_DELETE: Self = Self(0x4c);
+    pub const END: Self = Self(0x4d);
+    pub const PAGE_DOWN: Self = Self(0x4e);
     pub const RIGHT_ARROW: Self = Self(0x4f);
     pub const LEFT_ARROW: Self = Self(0x50);
     pub const DOWN_ARROW: Self = Self(0x51);

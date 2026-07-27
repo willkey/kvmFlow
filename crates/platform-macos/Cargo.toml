@@ -16,3 +16,7 @@ tracing.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
+libc = "0.2"
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFDictionary"] }
+objc2-io-kit = { version = "0.3", default-features = false, features = ["graphics", "hidsystem", "libc"] }

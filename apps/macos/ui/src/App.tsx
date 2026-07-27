@@ -3,7 +3,6 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppSnapshot,
   GateStatus,
-  KeyboardMonitorState,
   MetricProgress,
 } from "@kvmflow/ui-contracts";
 import {
@@ -11,15 +10,14 @@ import {
   confirmPairing,
   exportFoundationReport,
   getInitialSnapshot,
-  listenForKeyboardMonitor,
   listenForSnapshots,
   openAccessibilitySettings,
   refreshAccessibilityPermission,
   rejectPairing,
   returnControl,
-  setLocalControlAllowed,
+  setEmergencyStopActive,
 } from "./engineBridge";
-import KeyboardMonitor, { emptyKeyboardMonitor } from "./KeyboardMonitor";
+import brandMark from "../../../../assets/brand/kvmflow-mark.svg";
 import "./styles.css";
 
 const runtimeStatus: Record<AppSnapshot["phase"], string> = {
@@ -34,6 +32,16 @@ const gateLabels: Record<GateStatus, string> = {
   passed: "已通过",
   failed: "未通过",
   manualConfirmationRequired: "需要人工确认",
+};
+
+const clipboardTransferLabels: Record<
+  AppSnapshot["kvm"]["clipboard"]["transferState"],
+  string
+> = {
+  idle: "同步就绪",
+  sending: "正在发送",
+  receiving: "正在接收",
+  failed: "同步失败",
 };
 
 interface GateRowProps {
@@ -55,12 +63,9 @@ function GateRow({ label, progress }: GateRowProps) {
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot | null>(null);
-  const [keyboardMonitor, setKeyboardMonitor] =
-    useState<KeyboardMonitorState>(emptyKeyboardMonitor);
   const [snapshotErrorMessage, setSnapshotErrorMessage] = useState<string | null>(null);
   const [exportErrorMessage, setExportErrorMessage] = useState<string | null>(null);
   const [listenerErrorMessage, setListenerErrorMessage] = useState<string | null>(null);
-  const [keyboardErrorMessage, setKeyboardErrorMessage] = useState<string | null>(null);
   const [reportPath, setReportPath] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [commandErrorMessage, setCommandErrorMessage] = useState<string | null>(null);
@@ -71,7 +76,6 @@ export default function App() {
   useEffect(() => {
     let isCurrent = true;
     let snapshotUnlisten: UnlistenFn | undefined;
-    let keyboardUnlisten: UnlistenFn | undefined;
     let receivedSnapshotSinceInitialRequest = false;
 
     const applySnapshot = (nextSnapshot: AppSnapshot) => {
@@ -126,37 +130,9 @@ export default function App() {
         }
       });
 
-    void listenForKeyboardMonitor(
-      (monitor) => {
-        if (isCurrent) {
-          setKeyboardMonitor(monitor);
-          setKeyboardErrorMessage(null);
-        }
-      },
-      () => {
-        if (isCurrent) {
-          setKeyboardErrorMessage("收到无效键盘状态数据");
-        }
-      },
-    )
-      .then((release) => {
-        if (!isCurrent) {
-          release();
-          return;
-        }
-
-        keyboardUnlisten = release;
-      })
-      .catch(() => {
-        if (isCurrent) {
-          setKeyboardErrorMessage("无法连接键盘状态更新");
-        }
-      });
-
     return () => {
       isCurrent = false;
       snapshotUnlisten?.();
-      keyboardUnlisten?.();
     };
   }, []);
 
@@ -198,7 +174,6 @@ export default function App() {
   const status = snapshot ? macStatus(snapshot) : "正在加载";
   const errorMessages = [
     { source: "listener", message: listenerErrorMessage },
-    { source: "keyboard", message: keyboardErrorMessage },
     { source: "snapshot", message: snapshotErrorMessage },
     { source: "export", message: exportErrorMessage },
     { source: "command", message: commandErrorMessage },
@@ -208,17 +183,26 @@ export default function App() {
     <main className="app-shell" aria-labelledby="app-title">
       <header className="app-header">
         <div className="app-heading">
-          <p className="app-name">kvmFlow · Mac</p>
-          <h1 id="app-title">{status}</h1>
+          <img className="brand-mark" src={brandMark} alt="" />
+          <div>
+            <p className="app-name">kvmFlow <span>Mac 被控端</span></p>
+            <h1 id="app-title">{status}</h1>
+          </div>
         </div>
-        <button
-          className="export-command"
-          type="button"
-          onClick={handleExport}
-          disabled={isExporting}
-        >
-          导出基线报告
-        </button>
+        <div className="header-actions">
+          <span className={`link-badge link-badge--${snapshot?.kvm.link ?? "idle"}`}>
+            <i aria-hidden="true" />
+            {snapshot?.kvm.link === "online" ? "已连接" : "等待连接"}
+          </span>
+          <button
+            className="export-command"
+            type="button"
+            onClick={handleExport}
+            disabled={isExporting}
+          >
+            导出诊断
+          </button>
+        </div>
       </header>
 
       {snapshot?.diagnosticNotice ? (
@@ -293,29 +277,58 @@ export default function App() {
                 <dt>控制状态</dt>
                 <dd>{snapshot.kvm.control === "remote" ? "正在接收控制" : "本机"}</dd>
               </div>
-            </dl>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={snapshot.kvm.localPolicy === "allowed"}
-                onChange={(event) =>
-                  void runCommand(() => setLocalControlAllowed(event.currentTarget.checked))
-                }
-                disabled={isCommandPending}
-              />
-              允许远程控制
-            </label>
-            {snapshot.kvm.control === "remote" ? (
-              <div className="command-row">
-                <button
-                  type="button"
-                  onClick={() => void runCommand(returnControl)}
-                  disabled={isCommandPending}
-                >
-                  返回 Windows
-                </button>
+              <div>
+                <dt>剪贴板</dt>
+                <dd>
+                  {clipboardTransferLabels[snapshot.kvm.clipboard.transferState]}
+                </dd>
               </div>
+            </dl>
+            {snapshot.kvm.clipboard.lastError ? (
+              <p className="clipboard-error" role="alert">
+                {snapshot.kvm.clipboard.lastError}
+              </p>
             ) : null}
+            <div className="local-safety-control">
+              <div>
+                <strong>本机安全控制</strong>
+                <span>
+                  {snapshot.kvm.localPolicy === "paused"
+                    ? "本机已停止接收控制，Windows 无法远程恢复。"
+                    : "遇到异常时可立即释放按键并停止本次控制。"}
+                </span>
+              </div>
+              <div className="command-row">
+                {snapshot.kvm.localPolicy === "paused" ? (
+                  <button
+                    type="button"
+                    onClick={() => void runCommand(() => setEmergencyStopActive(false))}
+                    disabled={isCommandPending}
+                  >
+                    恢复等待控制
+                  </button>
+                ) : (
+                  <button
+                    className="danger-command"
+                    type="button"
+                    onClick={() => void runCommand(() => setEmergencyStopActive(true))}
+                    disabled={isCommandPending}
+                  >
+                    立即停止本次控制
+                  </button>
+                )}
+                {snapshot.kvm.control === "remote" ? (
+                  <button
+                    className="secondary-command"
+                    type="button"
+                    onClick={() => void runCommand(returnControl)}
+                    disabled={isCommandPending}
+                  >
+                    返回 Windows
+                  </button>
+                ) : null}
+              </div>
+            </div>
           </div>
         ) : (
           <form
@@ -379,8 +392,12 @@ export default function App() {
         ) : null}
       </section>
 
-      <KeyboardMonitor monitor={keyboardMonitor} caption="注入前接收" />
-
+      <details className="diagnostics-drawer">
+        <summary>
+          <span>运行与诊断</span>
+          <small>资源占用、运行时长与构建信息</small>
+        </summary>
+        <div className="diagnostics-content">
       <section className="status-section" aria-labelledby="metrics-heading">
         <div className="section-heading">
           <h2 id="metrics-heading">运行概览</h2>
@@ -459,6 +476,8 @@ export default function App() {
           />
         </ul>
       </section>
+        </div>
+      </details>
     </main>
   );
 }

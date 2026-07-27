@@ -24,6 +24,14 @@ export type ControlState =
   | "returningLocal";
 export type PermissionStatus = "unknown" | "missing" | "granted";
 export type LocalControlPolicy = "allowed" | "paused";
+export type ClipboardContentKind =
+  | "text"
+  | "html"
+  | "richText"
+  | "image"
+  | "files"
+  | "mixed";
+export type ClipboardTransferState = "idle" | "sending" | "receiving" | "failed";
 export type ScreenEdge = "left" | "right" | "top" | "bottom";
 export type ConnectionErrorStage =
   | "portBind"
@@ -74,6 +82,24 @@ export interface ValidationProgress {
   peakMemoryBytes: number | null;
   averageCpuPercent: number | null;
   peakCpuPercent: number | null;
+  kvm: KvmValidationProgress;
+}
+
+export interface KvmValidationProgress {
+  successfulEntries: number;
+  successfulReturns: number;
+  transitionFailures: number;
+  emergencyReturns: number;
+  emergencyReturnSampleCount: number;
+  peakEmergencyReturnMs: number | null;
+  disconnects: number;
+  reconnects: number;
+  networkRecoveries: number;
+  wakeRecoveries: number;
+  latencySampleCount: number;
+  averageLatencyMs: number | null;
+  p95LatencyMs: number | null;
+  peakLatencyMs: number | null;
 }
 
 export interface NetworkEndpoint {
@@ -81,11 +107,36 @@ export interface NetworkEndpoint {
   port: number;
 }
 
+export interface DisplayTarget {
+  id: string;
+  primary: boolean;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 export interface PairingStatus {
   code: string;
   localConfirmed: boolean;
   remoteConfirmed: boolean;
   expiresAtUnixMs: number;
+}
+
+export interface ClipboardHistoryItem {
+  id: string;
+  capturedAtUnixMs: number;
+  kind: ClipboardContentKind;
+  preview: string;
+  sizeBytes: number;
+  available: boolean;
+}
+
+export interface ClipboardStatus {
+  transferState: ClipboardTransferState;
+  lastError: string | null;
+  lastUpdatedUnixMs: number | null;
+  history: ClipboardHistoryItem[];
 }
 
 export interface ConnectionError {
@@ -103,17 +154,24 @@ export interface KvmStatus {
   control: ControlState;
   permission: PermissionStatus;
   localPolicy: LocalControlPolicy;
+  controlEnabled: boolean;
+  gameModeEnabled: boolean;
+  foregroundFullscreen: boolean;
+  remoteControlAvailable: boolean;
+  clipboard: ClipboardStatus;
   screenEdge: ScreenEdge;
+  targetDisplayId: string | null;
   endpoint: NetworkEndpoint | null;
   peerDeviceName: string | null;
   pairing: PairingStatus | null;
   latencyMs: number | null;
   sessionId: string | null;
+  consecutiveFailures: number;
   lastError: ConnectionError | null;
 }
 
 export interface AppSnapshot {
-  schemaVersion: 2;
+  schemaVersion: 6;
   role: EndpointRole;
   phase: RuntimePhase;
   windowState: WindowState;
@@ -134,6 +192,136 @@ export interface KeyboardMonitorState {
   sequence: number;
   pressed: number[];
   recent: KeyboardTransition[];
+}
+
+export interface KeyboardInteraction {
+  sequence: number;
+  usages: number[];
+  combination: boolean;
+  completed: boolean;
+}
+
+export function occupiedDisplayEdges(
+  displays: DisplayTarget[],
+  targetDisplayId: string | null,
+): ScreenEdge[] {
+  const target = displays.find((display) => display.id === targetDisplayId);
+  if (!target) {
+    return [];
+  }
+
+  const right = target.left + target.width;
+  const bottom = target.top + target.height;
+  const occupied = new Set<ScreenEdge>();
+
+  for (const display of displays) {
+    if (display.id === target.id) {
+      continue;
+    }
+
+    const displayRight = display.left + display.width;
+    const displayBottom = display.top + display.height;
+    const verticalOverlap = target.top < displayBottom && display.top < bottom;
+    const horizontalOverlap = target.left < displayRight && display.left < right;
+
+    if (displayRight === target.left && verticalOverlap) occupied.add("left");
+    if (display.left === right && verticalOverlap) occupied.add("right");
+    if (displayBottom === target.top && horizontalOverlap) occupied.add("top");
+    if (display.top === bottom && horizontalOverlap) occupied.add("bottom");
+  }
+
+  return ["left", "right", "top", "bottom"].filter((edge) =>
+    occupied.has(edge as ScreenEdge),
+  ) as ScreenEdge[];
+}
+
+const modifierUsages = new Set([0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7]);
+
+export function groupKeyboardInteractions(
+  monitor: KeyboardMonitorState,
+  limit = 8,
+): KeyboardInteraction[] {
+  const chronological = [...monitor.recent].sort(
+    (left, right) => left.sequence - right.sequence,
+  );
+  const usagesWithTransitions = new Set(chronological.map((transition) => transition.usage));
+  const heldModifiers = new Set(
+    monitor.pressed.filter(
+      (usage) => modifierUsages.has(usage) && !usagesWithTransitions.has(usage),
+    ),
+  );
+  const pendingModifiers = new Map<number, { sequence: number; used: boolean }>();
+  const activeKeys = new Map<number, KeyboardInteraction>();
+  const interactions: KeyboardInteraction[] = [];
+
+  for (const transition of chronological) {
+    if (modifierUsages.has(transition.usage)) {
+      if (transition.action === "down") {
+        heldModifiers.add(transition.usage);
+        if (!pendingModifiers.has(transition.usage)) {
+          pendingModifiers.set(transition.usage, {
+            sequence: transition.sequence,
+            used: false,
+          });
+        }
+      } else {
+        heldModifiers.delete(transition.usage);
+        const pending = pendingModifiers.get(transition.usage);
+        if (pending && !pending.used) {
+          interactions.push({
+            sequence: pending.sequence,
+            usages: [transition.usage],
+            combination: false,
+            completed: true,
+          });
+        }
+        pendingModifiers.delete(transition.usage);
+      }
+      continue;
+    }
+
+    if (transition.action === "down") {
+      if (activeKeys.has(transition.usage)) {
+        continue;
+      }
+      const modifiers = [...heldModifiers];
+      for (const modifier of modifiers) {
+        const pending = pendingModifiers.get(modifier);
+        if (pending) {
+          pending.used = true;
+        }
+      }
+      const interaction: KeyboardInteraction = {
+        sequence: transition.sequence,
+        usages: [...modifiers, transition.usage],
+        combination: modifiers.length > 0,
+        completed: false,
+      };
+      activeKeys.set(transition.usage, interaction);
+      interactions.push(interaction);
+    } else {
+      const interaction = activeKeys.get(transition.usage);
+      if (interaction) {
+        interaction.completed = true;
+        activeKeys.delete(transition.usage);
+      }
+    }
+  }
+
+  for (const [usage, pending] of pendingModifiers) {
+    if (!pending.used) {
+      interactions.push({
+        sequence: pending.sequence,
+        usages: [usage],
+        combination: false,
+        completed: false,
+      });
+    }
+  }
+
+  return interactions
+    .sort((left, right) => right.sequence - left.sequence)
+    .slice(0, Math.max(0, limit));
 }
 
 const endpointRoles = new Set<EndpointRole>([
@@ -173,6 +361,20 @@ const permissionStatuses = new Set<PermissionStatus>([
 ]);
 const localControlPolicies = new Set<LocalControlPolicy>(["allowed", "paused"]);
 const screenEdges = new Set<ScreenEdge>(["left", "right", "top", "bottom"]);
+const clipboardContentKinds = new Set<ClipboardContentKind>([
+  "text",
+  "html",
+  "richText",
+  "image",
+  "files",
+  "mixed",
+]);
+const clipboardTransferStates = new Set<ClipboardTransferState>([
+  "idle",
+  "sending",
+  "receiving",
+  "failed",
+]);
 const connectionErrorStages = new Set<ConnectionErrorStage>([
   "portBind",
   "reachability",
@@ -304,10 +506,34 @@ function parseKvmStatus(value: unknown, field: string): KvmStatus {
       localControlPolicies,
       `${field}.localPolicy`,
     ),
+    controlEnabled: parseBoolean(
+      requiredField(status, "controlEnabled", field),
+      `${field}.controlEnabled`,
+    ),
+    gameModeEnabled: parseBoolean(
+      requiredField(status, "gameModeEnabled", field),
+      `${field}.gameModeEnabled`,
+    ),
+    foregroundFullscreen: parseBoolean(
+      requiredField(status, "foregroundFullscreen", field),
+      `${field}.foregroundFullscreen`,
+    ),
+    remoteControlAvailable: parseBoolean(
+      requiredField(status, "remoteControlAvailable", field),
+      `${field}.remoteControlAvailable`,
+    ),
+    clipboard: parseClipboardStatus(
+      requiredField(status, "clipboard", field),
+      `${field}.clipboard`,
+    ),
     screenEdge: parseEnum(
       requiredField(status, "screenEdge", field),
       screenEdges,
       `${field}.screenEdge`,
+    ),
+    targetDisplayId: parseNullableString(
+      requiredField(status, "targetDisplayId", field),
+      `${field}.targetDisplayId`,
     ),
     endpoint: parseNetworkEndpoint(
       requiredField(status, "endpoint", field),
@@ -329,11 +555,105 @@ function parseKvmStatus(value: unknown, field: string): KvmStatus {
       requiredField(status, "sessionId", field),
       `${field}.sessionId`,
     ),
+    consecutiveFailures: parseU32(
+      requiredField(status, "consecutiveFailures", field),
+      `${field}.consecutiveFailures`,
+    ),
     lastError: parseConnectionError(
       requiredField(status, "lastError", field),
       `${field}.lastError`,
     ),
   };
+}
+
+function parseClipboardStatus(value: unknown, field: string): ClipboardStatus {
+  const status = requireObject(value, field);
+  const history = requiredField(status, "history", field);
+  if (!Array.isArray(history)) {
+    throw new TypeError(`${field}.history must be an array`);
+  }
+  return {
+    transferState: parseEnum(
+      requiredField(status, "transferState", field),
+      clipboardTransferStates,
+      `${field}.transferState`,
+    ),
+    lastError: parseNullableString(
+      requiredField(status, "lastError", field),
+      `${field}.lastError`,
+    ),
+    lastUpdatedUnixMs: parseNullableUnsignedSafeInteger(
+      requiredField(status, "lastUpdatedUnixMs", field),
+      `${field}.lastUpdatedUnixMs`,
+    ),
+    history: history.map((item, index) =>
+      parseClipboardHistoryItem(item, `${field}.history[${index}]`),
+    ),
+  };
+}
+
+function parseClipboardHistoryItem(
+  value: unknown,
+  field: string,
+): ClipboardHistoryItem {
+  const item = requireObject(value, field);
+  return {
+    id: parseString(requiredField(item, "id", field), `${field}.id`),
+    capturedAtUnixMs: parseUnsignedSafeInteger(
+      requiredField(item, "capturedAtUnixMs", field),
+      `${field}.capturedAtUnixMs`,
+    ),
+    kind: parseEnum(
+      requiredField(item, "kind", field),
+      clipboardContentKinds,
+      `${field}.kind`,
+    ),
+    preview: parseString(
+      requiredField(item, "preview", field),
+      `${field}.preview`,
+    ),
+    sizeBytes: parseUnsignedSafeInteger(
+      requiredField(item, "sizeBytes", field),
+      `${field}.sizeBytes`,
+    ),
+    available: parseBoolean(
+      requiredField(item, "available", field),
+      `${field}.available`,
+    ),
+  };
+}
+
+export function parseDisplayTargets(value: unknown): DisplayTarget[] {
+  if (!Array.isArray(value)) {
+    throw new TypeError("displays must be an array");
+  }
+  return value.map((display, index) => {
+    const field = `displays[${index}]`;
+    const target = requireObject(display, field);
+    return {
+      id: parseString(requiredField(target, "id", field), `${field}.id`),
+      primary: parseBoolean(
+        requiredField(target, "primary", field),
+        `${field}.primary`,
+      ),
+      left: parseSafeInteger(
+        requiredField(target, "left", field),
+        `${field}.left`,
+      ),
+      top: parseSafeInteger(
+        requiredField(target, "top", field),
+        `${field}.top`,
+      ),
+      width: parseUnsignedSafeInteger(
+        requiredField(target, "width", field),
+        `${field}.width`,
+      ),
+      height: parseUnsignedSafeInteger(
+        requiredField(target, "height", field),
+        `${field}.height`,
+      ),
+    };
+  });
 }
 
 function parseNetworkEndpoint(
@@ -519,6 +839,38 @@ function parseValidationProgress(value: unknown, field: string): ValidationProgr
       requiredField(validation, "peakCpuPercent", field),
       `${field}.peakCpuPercent`,
     ),
+    kvm: parseKvmValidationProgress(
+      requiredField(validation, "kvm", field),
+      `${field}.kvm`,
+    ),
+  };
+}
+
+function parseKvmValidationProgress(
+  value: unknown,
+  field: string,
+): KvmValidationProgress {
+  const kvm = requireObject(value, field);
+  const count = (name: string) =>
+    parseUnsignedSafeInteger(requiredField(kvm, name, field), `${field}.${name}`);
+  const latency = (name: string) =>
+    parseNullableNonNegativeNumber(requiredField(kvm, name, field), `${field}.${name}`);
+
+  return {
+    successfulEntries: count("successfulEntries"),
+    successfulReturns: count("successfulReturns"),
+    transitionFailures: count("transitionFailures"),
+    emergencyReturns: count("emergencyReturns"),
+    emergencyReturnSampleCount: count("emergencyReturnSampleCount"),
+    peakEmergencyReturnMs: latency("peakEmergencyReturnMs"),
+    disconnects: count("disconnects"),
+    reconnects: count("reconnects"),
+    networkRecoveries: count("networkRecoveries"),
+    wakeRecoveries: count("wakeRecoveries"),
+    latencySampleCount: count("latencySampleCount"),
+    averageLatencyMs: latency("averageLatencyMs"),
+    p95LatencyMs: latency("p95LatencyMs"),
+    peakLatencyMs: latency("peakLatencyMs"),
   };
 }
 
@@ -568,12 +920,12 @@ function requiredField(
   return value[key];
 }
 
-function parseSchemaVersion(value: unknown, field: string): 2 {
-  if (value !== 2) {
-    throw new TypeError(`${field} must be 2`);
+function parseSchemaVersion(value: unknown, field: string): 6 {
+  if (value !== 6) {
+    throw new TypeError(`${field} must be 6`);
   }
 
-  return 2;
+  return 6;
 }
 
 function parseEnum<T extends string>(
@@ -637,6 +989,14 @@ function parseNonNegativeNumber(value: unknown, field: string): number {
 function parseUnsignedSafeInteger(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new TypeError(`${field} must be a nonnegative safe integer`);
+  }
+
+  return value;
+}
+
+function parseSafeInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new TypeError(`${field} must be a safe integer`);
   }
 
   return value;

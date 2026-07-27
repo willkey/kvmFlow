@@ -22,7 +22,7 @@ pub struct AppSnapshot {
 impl From<&RuntimeState> for AppSnapshot {
     fn from(state: &RuntimeState) -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 6,
             role: state.role,
             phase: state.phase,
             window_state: state.window_state,

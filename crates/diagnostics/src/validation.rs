@@ -1,7 +1,8 @@
 use std::{collections::VecDeque, fmt::Write as _, fs, io::Write, path::PathBuf, time::Duration};
 
 use kvmflow_domain::{
-    BuildInfo, GateStatus, MetricProgress, ResourceSample, ValidationProgress, WindowState,
+    BuildInfo, GateStatus, KvmValidationProgress, MetricProgress, ResourceSample,
+    ValidationProgress, WindowState,
 };
 use serde::{Deserialize, Serialize};
 use tempfile::{Builder, NamedTempFile};
@@ -9,12 +10,27 @@ use tempfile::{Builder, NamedTempFile};
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 pub const PERSIST_INTERVAL: Duration = Duration::from_secs(60);
 pub const CPU_WINDOW_SAMPLES: usize = 60;
+pub const MEMORY_WINDOW_SAMPLES: usize = 6;
 pub const RECENT_SAMPLE_CAPACITY: usize = 360;
 pub const BACKGROUND_MEMORY_TARGET: u64 = 50 * 1024 * 1024;
 pub const BACKGROUND_MEMORY_BLOCKER: u64 = 80 * 1024 * 1024;
 pub const VISIBLE_MEMORY_TARGET: u64 = 180 * 1024 * 1024;
 pub const BACKGROUND_CPU_TARGET: f32 = 0.5;
 pub const BACKGROUND_CPU_BLOCKER: f32 = 1.0;
+const LATENCY_HISTOGRAM_MAX_MS: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KvmValidationEvent {
+    EnteredRemote,
+    ReturnedLocal,
+    TransitionFailed,
+    EmergencyReturn(Option<f32>),
+    Disconnected,
+    Reconnected,
+    NetworkRecovery,
+    WakeRecovery,
+    Latency(f32),
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,17 +51,20 @@ pub struct ValidationMonitor {
     first_observation_unix_ms: Option<u64>,
     latest_sample: Option<ResourceSample>,
     continuous_uptime_seconds: u64,
-    background_max_memory: Option<u64>,
+    background_memory_window: VecDeque<u64>,
     visible_max_memory: Option<u64>,
     background_cpu_window: VecDeque<f32>,
     background_cpu_sum: f64,
-    cpu_foundation_blocked: bool,
     total_sample_count: u64,
     valid_background_cpu_sample_count: u64,
     valid_cpu_sample_count: u64,
     cpu_sum: f64,
     peak_cpu_percent: Option<f32>,
     peak_memory_bytes: Option<u64>,
+    kvm: KvmValidationProgress,
+    latency_sum_ms: f64,
+    latency_histogram: Vec<u64>,
+    awaiting_reconnect: bool,
 }
 
 impl ValidationMonitor {
@@ -56,18 +75,74 @@ impl ValidationMonitor {
             first_observation_unix_ms: None,
             latest_sample: None,
             continuous_uptime_seconds: 0,
-            background_max_memory: None,
+            background_memory_window: VecDeque::with_capacity(MEMORY_WINDOW_SAMPLES),
             visible_max_memory: None,
             background_cpu_window: VecDeque::with_capacity(CPU_WINDOW_SAMPLES),
             background_cpu_sum: 0.0,
-            cpu_foundation_blocked: false,
             total_sample_count: 0,
             valid_background_cpu_sample_count: 0,
             valid_cpu_sample_count: 0,
             cpu_sum: 0.0,
             peak_cpu_percent: None,
             peak_memory_bytes: None,
+            kvm: KvmValidationProgress::default(),
+            latency_sum_ms: 0.0,
+            latency_histogram: vec![0; LATENCY_HISTOGRAM_MAX_MS + 2],
+            awaiting_reconnect: false,
         }
+    }
+
+    pub fn record_kvm(&mut self, event: KvmValidationEvent) -> ValidationProgress {
+        match event {
+            KvmValidationEvent::EnteredRemote => {
+                self.kvm.successful_entries = self.kvm.successful_entries.saturating_add(1)
+            }
+            KvmValidationEvent::ReturnedLocal => {
+                self.kvm.successful_returns = self.kvm.successful_returns.saturating_add(1)
+            }
+            KvmValidationEvent::TransitionFailed => {
+                self.kvm.transition_failures = self.kvm.transition_failures.saturating_add(1)
+            }
+            KvmValidationEvent::EmergencyReturn(response_ms) => {
+                self.kvm.emergency_returns = self.kvm.emergency_returns.saturating_add(1);
+                if let Some(response_ms) =
+                    response_ms.filter(|value| value.is_finite() && *value >= 0.0)
+                {
+                    self.kvm.emergency_return_sample_count =
+                        self.kvm.emergency_return_sample_count.saturating_add(1);
+                    self.kvm.peak_emergency_return_ms = Some(
+                        self.kvm
+                            .peak_emergency_return_ms
+                            .map_or(f64::from(response_ms), |peak| {
+                                peak.max(f64::from(response_ms))
+                            }),
+                    );
+                }
+            }
+            KvmValidationEvent::Disconnected => {
+                self.kvm.disconnects = self.kvm.disconnects.saturating_add(1);
+                self.awaiting_reconnect = true;
+            }
+            KvmValidationEvent::Reconnected => {
+                if self.awaiting_reconnect {
+                    self.kvm.reconnects = self.kvm.reconnects.saturating_add(1);
+                    self.awaiting_reconnect = false;
+                }
+            }
+            KvmValidationEvent::NetworkRecovery => {
+                self.kvm.network_recoveries = self.kvm.network_recoveries.saturating_add(1)
+            }
+            KvmValidationEvent::WakeRecovery => {
+                self.kvm.wake_recoveries = self.kvm.wake_recoveries.saturating_add(1)
+            }
+            KvmValidationEvent::Latency(milliseconds)
+                if milliseconds.is_finite() && milliseconds >= 0.0 =>
+            {
+                self.record_latency(milliseconds)
+            }
+            KvmValidationEvent::Latency(_) => {}
+        }
+        self.progress()
     }
 
     pub fn record(&mut self, sample: ResourceSample) -> ValidationProgress {
@@ -97,10 +172,11 @@ impl ValidationMonitor {
 
         match sample.window_state {
             WindowState::Closed => {
-                update_max(
-                    &mut self.background_max_memory,
-                    sample.resident_memory_bytes,
-                );
+                self.background_memory_window
+                    .push_back(sample.resident_memory_bytes);
+                if self.background_memory_window.len() > MEMORY_WINDOW_SAMPLES {
+                    self.background_memory_window.pop_front();
+                }
                 if sample.cpu_valid {
                     self.record_background_cpu(sample.cpu_percent);
                 }
@@ -116,7 +192,7 @@ impl ValidationMonitor {
     pub fn progress(&self) -> ValidationProgress {
         ValidationProgress {
             background_memory: memory_progress(
-                self.background_max_memory,
+                self.background_memory_window.iter().copied().max(),
                 BACKGROUND_MEMORY_TARGET,
             ),
             visible_memory: memory_progress(self.visible_max_memory, VISIBLE_MEMORY_TARGET),
@@ -128,12 +204,13 @@ impl ValidationMonitor {
             average_cpu_percent: (self.valid_cpu_sample_count > 0)
                 .then(|| self.cpu_sum / self.valid_cpu_sample_count as f64),
             peak_cpu_percent: self.peak_cpu_percent.map(f64::from),
+            kvm: self.kvm.clone(),
         }
     }
 
     pub fn report(&self, generated_at_unix_ms: u64) -> ValidationReport {
         ValidationReport {
-            schema_version: 1,
+            schema_version: 2,
             build: self.build.clone(),
             generated_at_unix_ms,
             latest_sample: self.latest_sample,
@@ -157,11 +234,6 @@ impl ValidationMonitor {
                 .expect("CPU window has an oldest sample when it exceeds its capacity");
             self.background_cpu_sum -= f64::from(oldest);
         }
-
-        self.cpu_foundation_blocked |= self.background_cpu_window.len() == CPU_WINDOW_SAMPLES
-            && self
-                .background_cpu_average()
-                .is_some_and(|cpu| cpu > f64::from(BACKGROUND_CPU_BLOCKER));
     }
 
     fn background_cpu_progress(&self) -> MetricProgress {
@@ -196,9 +268,49 @@ impl ValidationMonitor {
     }
 
     fn foundation_blocked(&self) -> bool {
-        self.background_max_memory
+        self.background_memory_window
+            .iter()
+            .copied()
+            .max()
             .is_some_and(|memory| memory > BACKGROUND_MEMORY_BLOCKER)
-            || self.cpu_foundation_blocked
+            || self.background_cpu_window.len() == CPU_WINDOW_SAMPLES
+                && self
+                    .background_cpu_average()
+                    .is_some_and(|cpu| cpu > f64::from(BACKGROUND_CPU_BLOCKER))
+    }
+
+    fn record_latency(&mut self, milliseconds: f32) {
+        self.kvm.latency_sample_count = self.kvm.latency_sample_count.saturating_add(1);
+        self.latency_sum_ms += f64::from(milliseconds);
+        self.kvm.average_latency_ms =
+            Some(self.latency_sum_ms / self.kvm.latency_sample_count.max(1) as f64);
+        self.kvm.peak_latency_ms = Some(
+            self.kvm
+                .peak_latency_ms
+                .map_or(f64::from(milliseconds), |peak| {
+                    peak.max(f64::from(milliseconds))
+                }),
+        );
+        let bucket = milliseconds.round().max(0.0) as usize;
+        let bucket = bucket.min(LATENCY_HISTOGRAM_MAX_MS + 1);
+        self.latency_histogram[bucket] = self.latency_histogram[bucket].saturating_add(1);
+        self.kvm.p95_latency_ms = self.latency_percentile(95);
+    }
+
+    fn latency_percentile(&self, percentile: u64) -> Option<f64> {
+        let count = self.kvm.latency_sample_count;
+        if count == 0 {
+            return None;
+        }
+        let target = count.saturating_mul(percentile).div_ceil(100).max(1);
+        let mut observed = 0_u64;
+        self.latency_histogram
+            .iter()
+            .enumerate()
+            .find_map(|(bucket, samples)| {
+                observed = observed.saturating_add(*samples);
+                (observed >= target).then_some(bucket as f64)
+            })
     }
 }
 

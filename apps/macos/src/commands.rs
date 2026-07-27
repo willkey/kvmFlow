@@ -130,7 +130,7 @@ mod tests {
         .expect("deserialize snapshot response");
 
         assert_eq!(response, engine.current_snapshot());
-        assert_eq!(response.schema_version, 2);
+        assert_eq!(response.schema_version, 6);
         assert_eq!(response.role, EndpointRole::MacEndpoint);
         tauri::async_runtime::block_on(engine.shutdown()).expect("shut down engine");
     }

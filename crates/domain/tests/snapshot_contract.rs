@@ -8,7 +8,7 @@ const APP_SNAPSHOT_FIXTURE: &str = include_str!("../../../fixtures/app-snapshot.
 fn fixture_deserializes_and_round_trips() {
     let snapshot: AppSnapshot = serde_json::from_str(APP_SNAPSHOT_FIXTURE).unwrap();
 
-    assert_eq!(snapshot.schema_version, 2);
+    assert_eq!(snapshot.schema_version, 6);
     assert_eq!(snapshot.role, EndpointRole::WindowsController);
     assert_eq!(snapshot.diagnostic_notice, None);
 
@@ -33,7 +33,7 @@ fn diagnostic_notice_round_trips_without_losing_the_fallback_warning() {
     );
     let snapshot = AppSnapshot::from(&state);
 
-    assert_eq!(snapshot.schema_version, 2);
+    assert_eq!(snapshot.schema_version, 6);
     let notice = snapshot.diagnostic_notice.as_ref().unwrap();
     assert_eq!(notice.code, DiagnosticNoticeCode::StorageFallback);
     assert_eq!(notice.message, "安装目录不可写，日志已切换到备用目录");

@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.96"
@@ -23,6 +23,7 @@ authors = ["kvmFlow contributors"]
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+clipboard-rs = "0.3.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 kvmflow-diagnostics = { path = "crates/diagnostics" }
 kvmflow-domain = { path = "crates/domain" }
@@ -38,6 +39,7 @@ sha2 = "0.10"
 sysinfo = "0.39.6"
 tauri = { version = "=2.11.2", features = ["tray-icon"] }
 tauri-build = "=2.6.2"
+tauri-plugin-single-instance = "=2.4.3"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net", "test-util"] }

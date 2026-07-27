@@ -88,6 +88,26 @@ pub struct ValidationProgress {
     pub peak_memory_bytes: Option<u64>,
     pub average_cpu_percent: Option<f64>,
     pub peak_cpu_percent: Option<f64>,
+    pub kvm: KvmValidationProgress,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvmValidationProgress {
+    pub successful_entries: u64,
+    pub successful_returns: u64,
+    pub transition_failures: u64,
+    pub emergency_returns: u64,
+    pub emergency_return_sample_count: u64,
+    pub peak_emergency_return_ms: Option<f64>,
+    pub disconnects: u64,
+    pub reconnects: u64,
+    pub network_recoveries: u64,
+    pub wake_recoveries: u64,
+    pub latency_sample_count: u64,
+    pub average_latency_ms: Option<f64>,
+    pub p95_latency_ms: Option<f64>,
+    pub peak_latency_ms: Option<f64>,
 }
 
 impl Default for ValidationProgress {
@@ -117,6 +137,7 @@ impl Default for ValidationProgress {
             peak_memory_bytes: None,
             average_cpu_percent: None,
             peak_cpu_percent: None,
+            kvm: KvmValidationProgress::default(),
         }
     }
 }

@@ -2,9 +2,9 @@ use std::{fs, sync::Arc};
 
 use kvmflow_diagnostics::{
     BACKGROUND_CPU_BLOCKER, BACKGROUND_CPU_TARGET, BACKGROUND_MEMORY_BLOCKER,
-    BACKGROUND_MEMORY_TARGET, CPU_WINDOW_SAMPLES, RECENT_SAMPLE_CAPACITY, SAMPLE_INTERVAL,
-    VISIBLE_MEMORY_TARGET, ValidationMonitor, ValidationReport, ValidationReportStore,
-    ValidationStore,
+    BACKGROUND_MEMORY_TARGET, CPU_WINDOW_SAMPLES, KvmValidationEvent, MEMORY_WINDOW_SAMPLES,
+    RECENT_SAMPLE_CAPACITY, SAMPLE_INTERVAL, VISIBLE_MEMORY_TARGET, ValidationMonitor,
+    ValidationReport, ValidationReportStore, ValidationStore,
 };
 use kvmflow_domain::{BuildInfo, GateStatus, ResourceSample, WindowState};
 use tempfile::tempdir;
@@ -79,6 +79,40 @@ fn no_sample_leaves_all_metrics_not_observed() {
 }
 
 #[test]
+fn kvm_events_and_latency_percentiles_are_recorded_without_input_content() {
+    let mut monitor = ValidationMonitor::new(build("kvm-progress"));
+
+    monitor.record_kvm(KvmValidationEvent::Reconnected);
+    monitor.record_kvm(KvmValidationEvent::EnteredRemote);
+    monitor.record_kvm(KvmValidationEvent::ReturnedLocal);
+    monitor.record_kvm(KvmValidationEvent::TransitionFailed);
+    monitor.record_kvm(KvmValidationEvent::EmergencyReturn(Some(12.5)));
+    monitor.record_kvm(KvmValidationEvent::Disconnected);
+    monitor.record_kvm(KvmValidationEvent::Reconnected);
+    monitor.record_kvm(KvmValidationEvent::NetworkRecovery);
+    monitor.record_kvm(KvmValidationEvent::WakeRecovery);
+    for latency in 1..=100 {
+        monitor.record_kvm(KvmValidationEvent::Latency(latency as f32));
+    }
+
+    let kvm = monitor.progress().kvm;
+    assert_eq!(kvm.successful_entries, 1);
+    assert_eq!(kvm.successful_returns, 1);
+    assert_eq!(kvm.transition_failures, 1);
+    assert_eq!(kvm.emergency_returns, 1);
+    assert_eq!(kvm.emergency_return_sample_count, 1);
+    assert_eq!(kvm.peak_emergency_return_ms, Some(12.5));
+    assert_eq!(kvm.disconnects, 1);
+    assert_eq!(kvm.reconnects, 1);
+    assert_eq!(kvm.network_recoveries, 1);
+    assert_eq!(kvm.wake_recoveries, 1);
+    assert_eq!(kvm.latency_sample_count, 100);
+    assert_eq!(kvm.average_latency_ms, Some(50.5));
+    assert_eq!(kvm.p95_latency_ms, Some(95.0));
+    assert_eq!(kvm.peak_latency_ms, Some(100.0));
+}
+
+#[test]
 fn fewer_than_sixty_valid_background_cpu_samples_are_collecting() {
     let mut monitor = ValidationMonitor::new(build("collecting"));
 
@@ -150,8 +184,8 @@ fn cpu_target_and_blocker_boundaries_are_distinct() {
 }
 
 #[test]
-fn cpu_blocker_latches_after_the_rolling_window_recovers() {
-    let mut monitor = ValidationMonitor::new(build("cpu-latch"));
+fn cpu_blocker_recovers_with_the_rolling_window() {
+    let mut monitor = ValidationMonitor::new(build("cpu-recovery"));
 
     record_background_cpu(&mut monitor, 1.1);
     assert!(monitor.report(1_700_000_000_000).foundation_blocked);
@@ -163,7 +197,7 @@ fn cpu_blocker_latches_after_the_rolling_window_recovers() {
     let progress = monitor.progress();
     assert_eq!(progress.background_cpu.status, GateStatus::Passed);
     assert!((progress.background_cpu.current.unwrap() - 0.4).abs() < 0.000_001);
-    assert!(monitor.report(1_700_000_000_000).foundation_blocked);
+    assert!(!monitor.report(1_700_000_000_000).foundation_blocked);
 }
 
 #[test]
@@ -244,6 +278,32 @@ fn background_memory_distinguishes_final_target_from_blocker() {
         GateStatus::Failed
     );
     assert!(above_blocker.report(1_700_000_000_000).foundation_blocked);
+}
+
+#[test]
+fn background_memory_recovers_without_erasing_the_historical_peak() {
+    let mut monitor = ValidationMonitor::new(build("memory-recovery"));
+    monitor.record(sample(
+        0,
+        WindowState::Closed,
+        BACKGROUND_MEMORY_BLOCKER + 1,
+        0.0,
+        false,
+    ));
+    for index in 1..=MEMORY_WINDOW_SAMPLES as u64 {
+        monitor.record(sample(index, WindowState::Closed, 40 * MIB, 0.0, false));
+    }
+
+    let report = monitor.report(1_700_000_000_000);
+    assert_eq!(
+        report.progress.background_memory.current,
+        Some((40 * MIB) as f64)
+    );
+    assert_eq!(
+        report.progress.peak_memory_bytes,
+        Some(BACKGROUND_MEMORY_BLOCKER + 1)
+    );
+    assert!(!report.foundation_blocked);
 }
 
 #[test]
@@ -384,7 +444,7 @@ async fn concurrent_persistence_for_the_same_destination_succeeds_and_cleans_tem
 }
 
 #[test]
-fn bounded_recent_history_preserves_long_lived_aggregate_state() {
+fn bounded_recent_history_preserves_peaks_without_stale_gate_failures() {
     let mut monitor = ValidationMonitor::new(build("bounded-history"));
     let total = RECENT_SAMPLE_CAPACITY as u64 + 1;
 
@@ -405,9 +465,13 @@ fn bounded_recent_history_preserves_long_lived_aggregate_state() {
     );
     assert_eq!(
         report.progress.background_memory.current,
-        Some((BACKGROUND_MEMORY_BLOCKER + 1) as f64)
+        Some((40 * MIB) as f64)
     );
-    assert!(report.foundation_blocked);
+    assert_eq!(
+        report.progress.peak_memory_bytes,
+        Some(BACKGROUND_MEMORY_BLOCKER + 1)
+    );
+    assert!(!report.foundation_blocked);
     assert_eq!(
         report.progress.continuous_uptime_seconds,
         total.saturating_sub(1) * SAMPLE_INTERVAL.as_secs()

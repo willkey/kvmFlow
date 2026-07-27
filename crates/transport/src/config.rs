@@ -10,7 +10,7 @@ use tempfile::Builder;
 
 use crate::TrustedPeer;
 
-const CONFIG_SCHEMA_VERSION: u16 = 3;
+const CONFIG_SCHEMA_VERSION: u16 = 5;
 pub const DEFAULT_MAC_LISTEN_PORT: u16 = 45_888;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +21,12 @@ pub struct WindowsRuntimeConfig {
     pub local_device_id: Option<String>,
     pub endpoint: Option<NetworkEndpoint>,
     pub edge: ScreenEdge,
+    #[serde(default)]
+    pub target_display_id: Option<String>,
+    #[serde(default = "enabled_by_default")]
+    pub control_enabled: bool,
+    #[serde(default = "enabled_by_default")]
+    pub game_mode_enabled: bool,
     pub trusted_peer: Option<TrustedPeer>,
 }
 
@@ -31,9 +37,16 @@ impl Default for WindowsRuntimeConfig {
             local_device_id: None,
             endpoint: None,
             edge: ScreenEdge::Bottom,
+            target_display_id: None,
+            control_enabled: true,
+            game_mode_enabled: true,
             trusted_peer: None,
         }
     }
+}
+
+const fn enabled_by_default() -> bool {
+    true
 }
 
 impl WindowsRuntimeConfig {
@@ -48,6 +61,9 @@ impl WindowsRuntimeConfig {
         {
             self.endpoint = None;
         }
+        self.target_display_id = self
+            .target_display_id
+            .filter(|display_id| !display_id.trim().is_empty());
         self.schema_version = CONFIG_SCHEMA_VERSION;
         self
     }
@@ -100,6 +116,12 @@ impl ConfigStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("configuration path always has a data directory")
     }
 
     pub fn load_windows(&self) -> Result<WindowsRuntimeConfig, ConfigError> {
@@ -224,6 +246,7 @@ mod tests {
                 port: 49_000,
             }),
             edge: ScreenEdge::Left,
+            target_display_id: Some(r"\\.\DISPLAY2".into()),
             ..WindowsRuntimeConfig::default()
         };
         let mac = MacRuntimeConfig {
@@ -236,6 +259,30 @@ mod tests {
         assert_eq!(store.load_windows().expect("load Windows config"), windows);
         store.save_macos(&mac).expect("save Mac config");
         assert_eq!(store.load_macos().expect("load Mac config"), mac);
+    }
+
+    #[test]
+    fn legacy_windows_config_enables_control_by_default() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let store = ConfigStore::new(directory.path());
+        fs::write(
+            store.path(),
+            r#"{
+                "schemaVersion": 4,
+                "localDeviceId": null,
+                "endpoint": null,
+                "edge": "bottom",
+                "targetDisplayId": null,
+                "trustedPeer": null
+            }"#,
+        )
+        .expect("write legacy config");
+
+        let config = store.load_windows().expect("load legacy config");
+
+        assert!(config.control_enabled);
+        assert!(config.game_mode_enabled);
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
     }
 
     #[test]
@@ -315,5 +362,23 @@ mod tests {
 
         assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(config.edge, ScreenEdge::Bottom);
+        assert_eq!(config.target_display_id, None);
+    }
+
+    #[test]
+    fn blank_legacy_display_id_is_removed_without_resetting_connection() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let store = ConfigStore::new(directory.path());
+        fs::write(
+            store.path(),
+            r#"{"schemaVersion":3,"endpoint":{"ip":"192.168.1.20","port":45888},"edge":"bottom","targetDisplayId":"  ","trustedPeer":null}"#,
+        )
+        .expect("write legacy Windows config");
+
+        let config = store.load_windows().expect("load migrated Windows config");
+
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.target_display_id, None);
+        assert_eq!(config.endpoint.unwrap().ip, "192.168.1.20");
     }
 }

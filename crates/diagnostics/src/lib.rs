@@ -19,7 +19,8 @@ pub use storage::{
 };
 pub use validation::{
     BACKGROUND_CPU_BLOCKER, BACKGROUND_CPU_TARGET, BACKGROUND_MEMORY_BLOCKER,
-    BACKGROUND_MEMORY_TARGET, CPU_WINDOW_SAMPLES, PERSIST_INTERVAL, RECENT_SAMPLE_CAPACITY,
-    SAMPLE_INTERVAL, VISIBLE_MEMORY_TARGET, ValidationMonitor, ValidationReport,
-    ValidationReportStore, ValidationStore, ValidationStoreError,
+    BACKGROUND_MEMORY_TARGET, CPU_WINDOW_SAMPLES, KvmValidationEvent, MEMORY_WINDOW_SAMPLES,
+    PERSIST_INTERVAL, RECENT_SAMPLE_CAPACITY, SAMPLE_INTERVAL, VISIBLE_MEMORY_TARGET,
+    ValidationMonitor, ValidationReport, ValidationReportStore, ValidationStore,
+    ValidationStoreError,
 };

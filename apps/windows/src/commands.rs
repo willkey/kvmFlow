@@ -1,5 +1,6 @@
-use kvmflow_domain::{AppSnapshot, NetworkEndpoint, ScreenEdge};
+use kvmflow_domain::{AppSnapshot, DisplayTarget, NetworkEndpoint, ScreenEdge};
 use kvmflow_engine::{EngineCommand, EngineHandle};
+use kvmflow_platform_windows::available_windows_displays;
 
 fn snapshot_payload(engine: &EngineHandle) -> AppSnapshot {
     engine.current_snapshot()
@@ -75,9 +76,70 @@ pub async fn configure_screen_edge(
 }
 
 #[tauri::command]
+pub fn list_displays() -> Result<Vec<DisplayTarget>, String> {
+    available_windows_displays().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn configure_target_display(
+    display_id: String,
+    engine: tauri::State<'_, EngineHandle>,
+) -> Result<(), String> {
+    let displays = available_windows_displays().map_err(|error| error.to_string())?;
+    if !displays.iter().any(|display| display.id == display_id) {
+        return Err("选择的显示器当前不可用".into());
+    }
+    engine
+        .send(EngineCommand::ConfigureTargetDisplay(display_id))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn return_control(engine: tauri::State<'_, EngineHandle>) -> Result<(), String> {
     engine
         .send(EngineCommand::ReturnControl)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn set_control_enabled(
+    enabled: bool,
+    engine: tauri::State<'_, EngineHandle>,
+) -> Result<(), String> {
+    engine
+        .send(EngineCommand::SetControlEnabled(enabled))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn set_game_mode_enabled(
+    enabled: bool,
+    engine: tauri::State<'_, EngineHandle>,
+) -> Result<(), String> {
+    engine
+        .send(EngineCommand::SetGameModeEnabled(enabled))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn activate_clipboard_history(
+    id: String,
+    engine: tauri::State<'_, EngineHandle>,
+) -> Result<(), String> {
+    engine
+        .send(EngineCommand::ActivateClipboardHistory(id))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_clipboard_history(engine: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    engine
+        .send(EngineCommand::ClearClipboardHistory)
         .await
         .map_err(|error| error.to_string())
 }
@@ -124,7 +186,7 @@ mod tests {
 
         assert_eq!(response, engine.current_snapshot());
         let snapshot = response;
-        assert_eq!(snapshot.schema_version, 2);
+        assert_eq!(snapshot.schema_version, 6);
         assert_eq!(snapshot.role, EndpointRole::WindowsController);
         tauri::async_runtime::block_on(engine.shutdown()).expect("shut down engine");
     }

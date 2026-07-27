@@ -2,10 +2,96 @@ import fixture from "../../../fixtures/app-snapshot.json";
 import { describe, expect, it } from "vitest";
 
 import {
+  groupKeyboardInteractions,
+  occupiedDisplayEdges,
   parseAppSnapshot,
+  parseDisplayTargets,
   parseKeyboardMonitorState,
   type AppSnapshot,
 } from "./index.js";
+
+describe("occupiedDisplayEdges", () => {
+  const displays = [
+    {
+      id: "primary",
+      primary: true,
+      left: 0,
+      top: 0,
+      width: 1920,
+      height: 1080,
+    },
+    {
+      id: "secondary",
+      primary: false,
+      left: 1920,
+      top: -180,
+      width: 2560,
+      height: 1440,
+    },
+  ];
+
+  it("blocks each side of a shared Windows display boundary", () => {
+    expect(occupiedDisplayEdges(displays, "primary")).toEqual(["right"]);
+    expect(occupiedDisplayEdges(displays, "secondary")).toEqual(["left"]);
+  });
+
+  it("leaves a direction available when displays only touch at a corner", () => {
+    expect(
+      occupiedDisplayEdges(
+        [
+          displays[0],
+          {
+            id: "corner",
+            primary: false,
+            left: 1920,
+            top: 1080,
+            width: 800,
+            height: 600,
+          },
+        ],
+        "primary",
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("parseDisplayTargets", () => {
+  it("accepts negative desktop coordinates and rejects invalid dimensions", () => {
+    expect(
+      parseDisplayTargets([
+        {
+          id: "\\\\.\\DISPLAY2",
+          primary: false,
+          left: -2560,
+          top: -360,
+          width: 2560,
+          height: 1440,
+        },
+      ]),
+    ).toEqual([
+      {
+        id: "\\\\.\\DISPLAY2",
+        primary: false,
+        left: -2560,
+        top: -360,
+        width: 2560,
+        height: 1440,
+      },
+    ]);
+    expect(() =>
+      parseDisplayTargets([
+        {
+          id: "display",
+          primary: true,
+          left: 0,
+          top: 0,
+          width: -1,
+          height: 1080,
+        },
+      ]),
+    ).toThrow(TypeError);
+  });
+});
 
 function cloneFixture(): Record<string, unknown> {
   return structuredClone(fixture) as Record<string, unknown>;
@@ -163,7 +249,7 @@ describe("parseAppSnapshot", () => {
   });
 
   it.each([
-    [["schemaVersion"], 3],
+    [["schemaVersion"], 7],
     [["role"], "linuxEndpoint"],
     [["phase"], "paused"],
     [["windowState"], "minimized"],
@@ -416,5 +502,82 @@ describe("parseKeyboardMonitorState", () => {
     },
   ])("rejects malformed monitor payload %#", (input) => {
     expect(() => parseKeyboardMonitorState(input)).toThrow(TypeError);
+  });
+});
+
+describe("groupKeyboardInteractions", () => {
+  it("groups arbitrary modifiers and a main key into one completed interaction", () => {
+    expect(
+      groupKeyboardInteractions({
+        sequence: 6,
+        pressed: [],
+        recent: [
+          { sequence: 6, usage: 0xe3, action: "up" },
+          { sequence: 5, usage: 0xe1, action: "up" },
+          { sequence: 4, usage: 0x04, action: "up" },
+          { sequence: 3, usage: 0x04, action: "down" },
+          { sequence: 2, usage: 0xe1, action: "down" },
+          { sequence: 1, usage: 0xe3, action: "down" },
+        ],
+      }),
+    ).toEqual([
+      {
+        sequence: 3,
+        usages: [0xe3, 0xe1, 0x04],
+        combination: true,
+        completed: true,
+      },
+    ]);
+  });
+
+  it("keeps one held modifier across multiple combinations and ignores repeats", () => {
+    expect(
+      groupKeyboardInteractions({
+        sequence: 7,
+        pressed: [],
+        recent: [
+          { sequence: 7, usage: 0xe3, action: "up" },
+          { sequence: 6, usage: 0x19, action: "up" },
+          { sequence: 5, usage: 0x19, action: "down" },
+          { sequence: 4, usage: 0x06, action: "up" },
+          { sequence: 3, usage: 0x06, action: "down" },
+          { sequence: 2, usage: 0x06, action: "down" },
+          { sequence: 1, usage: 0xe3, action: "down" },
+        ],
+      }),
+    ).toEqual([
+      {
+        sequence: 5,
+        usages: [0xe3, 0x19],
+        combination: true,
+        completed: true,
+      },
+      {
+        sequence: 2,
+        usages: [0xe3, 0x06],
+        combination: true,
+        completed: true,
+      },
+    ]);
+  });
+
+  it("shows a standalone lock key as one interaction", () => {
+    expect(
+      groupKeyboardInteractions({
+        sequence: 2,
+        pressed: [],
+        recent: [
+          { sequence: 2, usage: 0x39, action: "up" },
+          { sequence: 1, usage: 0x39, action: "down" },
+        ],
+      }),
+    ).toEqual([
+      {
+        sequence: 1,
+        usages: [0x39],
+        combination: false,
+        completed: true,
+      },
+    ]);
   });
 });

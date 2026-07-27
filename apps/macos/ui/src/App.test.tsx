@@ -14,7 +14,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: tauriMocks.listen }));
 type TauriEventHandler = (event: { payload: unknown }) => void;
 
 const initialSnapshot: AppSnapshot = {
-  schemaVersion: 2,
+  schemaVersion: 6,
   role: "macEndpoint",
   phase: "running",
   windowState: "open",
@@ -46,6 +46,22 @@ const initialSnapshot: AppSnapshot = {
     peakMemoryBytes: null,
     averageCpuPercent: null,
     peakCpuPercent: null,
+    kvm: {
+      successfulEntries: 0,
+      successfulReturns: 0,
+      transitionFailures: 0,
+      emergencyReturns: 0,
+      emergencyReturnSampleCount: 0,
+      peakEmergencyReturnMs: null,
+      disconnects: 0,
+      reconnects: 0,
+      networkRecoveries: 0,
+      wakeRecoveries: 0,
+      latencySampleCount: 0,
+      averageLatencyMs: null,
+      p95LatencyMs: null,
+      peakLatencyMs: null,
+    },
   },
   kvm: {
     trust: "unpaired",
@@ -53,12 +69,24 @@ const initialSnapshot: AppSnapshot = {
     control: "local",
     permission: "unknown",
     localPolicy: "allowed",
+    controlEnabled: true,
+    gameModeEnabled: true,
+    foregroundFullscreen: false,
+    remoteControlAvailable: true,
+    clipboard: {
+      transferState: "idle",
+      lastError: null,
+      lastUpdatedUnixMs: null,
+      history: [],
+    },
     screenEdge: "bottom",
+    targetDisplayId: null,
     endpoint: { ip: "0.0.0.0", port: 45_888 },
     peerDeviceName: null,
     pairing: null,
     latencyMs: null,
     sessionId: null,
+    consecutiveFailures: 0,
     lastError: null,
   },
 };
@@ -73,16 +101,18 @@ async function flushPromises(): Promise<void> {
   });
 }
 
+function openDiagnostics(): void {
+  fireEvent.click(screen.getByText("运行与诊断"));
+}
+
 describe("App", () => {
   let eventHandlers: Map<string, TauriEventHandler>;
   let snapshotUnlisten: ReturnType<typeof vi.fn>;
-  let keyboardUnlisten: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.useFakeTimers();
     eventHandlers = new Map();
     snapshotUnlisten = vi.fn();
-    keyboardUnlisten = vi.fn();
     tauriMocks.invoke.mockImplementation((command: string) => {
       if (command === "get_snapshot") {
         return Promise.resolve(cloneSnapshot());
@@ -97,9 +127,7 @@ describe("App", () => {
     tauriMocks.listen.mockImplementation(
       async (eventName: string, callback: TauriEventHandler) => {
         eventHandlers.set(eventName, callback);
-        return eventName === "engine://snapshot"
-          ? snapshotUnlisten
-          : keyboardUnlisten;
+        return snapshotUnlisten;
       },
     );
   });
@@ -114,20 +142,15 @@ describe("App", () => {
     render(<App />);
     await flushPromises();
 
-    expect(screen.getByText("kvmFlow · Mac")).toBeVisible();
+    expect(screen.getByText("Mac 被控端")).toBeVisible();
     expect(
       screen.getByRole("heading", { level: 1, name: "等待 Windows 连接" }),
     ).toBeVisible();
-    expect(screen.getByText("运行概览")).toBeVisible();
-    expect(screen.getByText("资源门槛")).toBeVisible();
-    expect(screen.getByText("构建 ID")).toBeVisible();
-    expect(screen.getByText("进程数")).toBeVisible();
-    expect(screen.getByText("当前 CPU")).toBeVisible();
-    expect(screen.getByText("当前内存")).toBeVisible();
+    expect(screen.getByText("运行与诊断")).toBeVisible();
     expect(screen.getByText("连接状态")).toBeVisible();
     expect(screen.getByLabelText("TCP 监听端口")).toHaveValue("45888");
     expect(screen.getByRole("button", { name: "应用端口" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "导出基线报告" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "导出诊断" })).toBeVisible();
   });
 
   it("invokes get_snapshot exactly once on mount", async () => {
@@ -138,24 +161,18 @@ describe("App", () => {
     expect(tauriMocks.invoke).toHaveBeenCalledWith("get_snapshot");
   });
 
-  it("registers snapshot and keyboard listeners and unlistens on unmount", async () => {
+  it("registers the snapshot listener and unlistens on unmount", async () => {
     const { unmount } = render(<App />);
     await flushPromises();
 
-    expect(tauriMocks.listen).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.listen).toHaveBeenCalledTimes(1);
     expect(tauriMocks.listen).toHaveBeenCalledWith(
       "engine://snapshot",
       expect.any(Function),
     );
-    expect(tauriMocks.listen).toHaveBeenCalledWith(
-      "engine://keyboard",
-      expect.any(Function),
-    );
-
     unmount();
 
     expect(snapshotUnlisten).toHaveBeenCalledTimes(1);
-    expect(keyboardUnlisten).toHaveBeenCalledTimes(1);
   });
 
   it("does not poll after one fake minute", async () => {
@@ -195,6 +212,7 @@ describe("App", () => {
     initialSnapshotAfterEvent.build.buildId = "stale-initial-build";
     resolveInitialSnapshot?.(initialSnapshotAfterEvent);
     await flushPromises();
+    openDiagnostics();
 
     expect(screen.getByText("event-build")).toBeVisible();
     expect(screen.queryByText("stale-initial-build")).not.toBeInTheDocument();
@@ -219,6 +237,7 @@ describe("App", () => {
     act(() => {
       eventHandlers.get("engine://snapshot")?.({ payload: emittedSnapshot });
     });
+    openDiagnostics();
 
     expect(screen.getByText("build-emitted")).toBeVisible();
     expect(screen.getByText("4", { selector: ".metric dd" })).toBeVisible();
@@ -237,7 +256,7 @@ describe("App", () => {
     render(<App />);
     await flushPromises();
 
-    fireEvent.click(screen.getByRole("button", { name: "导出基线报告" }));
+    fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
     await flushPromises();
 
     expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
@@ -336,6 +355,7 @@ describe("App", () => {
 
     resolveInitialSnapshot?.(cloneSnapshot());
     await flushPromises();
+    openDiagnostics();
 
     expect(screen.getByText("fixture-build")).toBeVisible();
     expect(screen.getByRole("alert")).toHaveTextContent("无法连接状态更新");
@@ -346,6 +366,7 @@ describe("App", () => {
 
     render(<App />);
     await flushPromises();
+    openDiagnostics();
 
     expect(screen.getByRole("alert")).toHaveTextContent("无法加载状态");
   });
@@ -353,6 +374,7 @@ describe("App", () => {
   it("shows a concise Chinese error for a malformed snapshot event without crashing", async () => {
     render(<App />);
     await flushPromises();
+    openDiagnostics();
 
     expect(() => {
       act(() => {
@@ -378,7 +400,7 @@ describe("App", () => {
 
     render(<App />);
     await flushPromises();
-    fireEvent.click(screen.getByRole("button", { name: "导出基线报告" }));
+    fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
     await flushPromises();
 
     expect(screen.getByRole("alert")).toHaveTextContent("无法导出报告");
@@ -396,11 +418,12 @@ describe("App", () => {
 
     render(<App />);
     await flushPromises();
+    openDiagnostics();
 
     expect(screen.getByText("fixture-build")).toBeVisible();
     expect(screen.getByRole("alert")).toHaveTextContent("无法连接状态更新");
 
-    fireEvent.click(screen.getByRole("button", { name: "导出基线报告" }));
+    fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
     await flushPromises();
 
     const alert = screen.getByRole("alert");
@@ -420,7 +443,7 @@ describe("App", () => {
 
       render(<App />);
       await flushPromises();
-      fireEvent.click(screen.getByRole("button", { name: "导出基线报告" }));
+      fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
       await flushPromises();
 
       expect(screen.getByRole("alert")).toHaveTextContent("无法导出报告");
@@ -430,6 +453,7 @@ describe("App", () => {
       act(() => {
         eventHandlers.get("engine://snapshot")?.({ payload: nextSnapshot });
       });
+      openDiagnostics();
 
       expect(screen.getByText("newer-event-build")).toBeVisible();
       expect(screen.getByRole("alert")).toHaveTextContent("无法导出报告");
@@ -453,13 +477,13 @@ describe("App", () => {
 
       render(<App />);
       await flushPromises();
-      fireEvent.click(screen.getByRole("button", { name: "导出基线报告" }));
+      fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
       await flushPromises();
 
       expect(screen.getByRole("alert")).toHaveTextContent("无法连接状态更新");
       expect(screen.getByRole("alert")).toHaveTextContent("无法导出报告");
 
-      fireEvent.click(screen.getByRole("button", { name: "导出基线报告" }));
+      fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
       await flushPromises();
 
       const alert = screen.getByRole("alert");
@@ -485,7 +509,7 @@ describe("App", () => {
       act(() => {
         eventHandlers.get("engine://snapshot")?.({ payload: { schemaVersion: 1 } });
       });
-      fireEvent.click(screen.getByRole("button", { name: "导出基线报告" }));
+      fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
       await flushPromises();
 
       const alerts = screen.getAllByRole("alert");
@@ -493,43 +517,6 @@ describe("App", () => {
       expect(alerts[0]).toHaveTextContent("收到无效状态数据");
       expect(alerts[0]).toHaveTextContent("无法导出报告");
     });
-  });
-
-  it("renders received pressed keys and recent keyboard transitions", async () => {
-    render(<App />);
-    await flushPromises();
-
-    act(() => {
-      eventHandlers.get("engine://keyboard")?.({
-        payload: {
-          sequence: 2,
-          pressed: [0xe3, 0x52],
-          recent: [
-            { sequence: 2, usage: 0x52, action: "down" },
-            { sequence: 1, usage: 0xe3, action: "down" },
-          ],
-        },
-      });
-    });
-
-    const details = screen.getByText("键盘交互").closest("details");
-    expect(details).not.toHaveAttribute("open");
-    fireEvent.click(screen.getByText("键盘交互"));
-    const keyboard = screen.getByLabelText("Mac 实时键盘状态");
-    expect(keyboard.querySelector('[data-usage="227"]')).toHaveAttribute(
-      "data-pressed",
-      "true",
-    );
-    expect(keyboard.querySelector('[data-usage="82"]')).toHaveAttribute(
-      "data-pressed",
-      "true",
-    );
-    expect(screen.getByText(/注入前接收 · 当前按下 2 个键/)).toBeVisible();
-    expect(screen.getAllByText("按下")).toHaveLength(2);
-    expect(screen.getAllByText("command").length).toBeGreaterThan(0);
-
-    fireEvent.click(screen.getByRole("button", { name: "全尺寸键盘" }));
-    expect(screen.getByLabelText("数字键盘")).toBeVisible();
   });
 
   it("unlistens when an async listener resolves after unmount", async () => {
@@ -548,7 +535,6 @@ describe("App", () => {
     await flushPromises();
 
     expect(snapshotUnlisten).toHaveBeenCalledTimes(1);
-    expect(keyboardUnlisten).toHaveBeenCalledTimes(1);
   });
 });
 

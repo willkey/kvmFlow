@@ -22,11 +22,10 @@ try {
     }
     $shortSha = ($shortShaOutput | Out-String).Trim()
     $buildId = "$timestamp-$shortSha"
-    $packageRoot = Join-Path $repoRoot (Join-Path "dist/windows" $buildId)
-
-    if (Test-Path -LiteralPath $packageRoot) {
-        throw "package destination already exists: $packageRoot"
-    }
+    $packageRoot = Join-Path $repoRoot "dist/windows/current"
+    $executablePath = Join-Path $packageRoot "kvmFlow.exe"
+    $nextExecutable = Join-Path $packageRoot ".kvmFlow.exe.next-$buildId"
+    $previousExecutable = Join-Path $packageRoot ".kvmFlow.exe.previous"
 
     $stagingRoot = Join-Path $env:TEMP "kvmflow-build-$buildId-$PID"
     $archivePath = Join-Path $stagingRoot "source.zip"
@@ -57,17 +56,47 @@ try {
         Pop-Location
     }
 
-    New-Item -ItemType Directory -Path (Split-Path -Parent $packageRoot) -Force | Out-Null
-    New-Item -ItemType Directory -Path $packageRoot | Out-Null
-    Copy-Item (Join-Path $buildRoot "target/release/kvmFlow.exe") (Join-Path $packageRoot "kvmFlow.exe")
+    New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
     foreach ($directory in @("data", "logs", "diagnostics")) {
-        New-Item -ItemType Directory -Path (Join-Path $packageRoot $directory) | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $packageRoot $directory) -Force | Out-Null
+    }
+    if (!(Test-Path -LiteralPath $executablePath) -and (Test-Path -LiteralPath $previousExecutable)) {
+        Move-Item -LiteralPath $previousExecutable -Destination $executablePath
+    }
+    if (Test-Path -LiteralPath $previousExecutable) {
+        Remove-Item -LiteralPath $previousExecutable -Force
+    }
+    Copy-Item (Join-Path $buildRoot "target/release/kvmFlow.exe") $nextExecutable
+
+    $hadPreviousExecutable = Test-Path -LiteralPath $executablePath
+    try {
+        if ($hadPreviousExecutable) {
+            Move-Item -LiteralPath $executablePath -Destination $previousExecutable
+        }
+        Move-Item -LiteralPath $nextExecutable -Destination $executablePath
+
+        node (Join-Path $buildRoot "scripts/verify-package-layout.mjs") $packageRoot windows
+        if ($LASTEXITCODE -ne 0) {
+            throw "Windows package layout verification failed"
+        }
+    }
+    catch {
+        if (Test-Path -LiteralPath $nextExecutable) {
+            Remove-Item -LiteralPath $nextExecutable -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $executablePath) {
+            Remove-Item -LiteralPath $executablePath -Force -ErrorAction SilentlyContinue
+        }
+        if ($hadPreviousExecutable -and (Test-Path -LiteralPath $previousExecutable)) {
+            Move-Item -LiteralPath $previousExecutable -Destination $executablePath
+        }
+        throw "failed to install the new Windows executable; close kvmFlow and retry: $($_.Exception.Message)"
     }
 
-    node (Join-Path $buildRoot "scripts/verify-package-layout.mjs") $packageRoot windows
-    if ($LASTEXITCODE -ne 0) {
-        throw "Windows package layout verification failed"
+    if (Test-Path -LiteralPath $previousExecutable) {
+        Remove-Item -LiteralPath $previousExecutable -Force
     }
+    Set-Content -LiteralPath (Join-Path $packageRoot "build-id.txt") -Value $buildId
     Write-Output $packageRoot
 }
 finally {

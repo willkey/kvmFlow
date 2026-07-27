@@ -9,7 +9,6 @@ use kvmflow_diagnostics::{
 };
 use kvmflow_domain::{
     AppSnapshot, BuildInfo, DiagnosticNotice, DiagnosticNoticeCode, EndpointRole,
-    KeyboardMonitorState,
 };
 #[cfg(test)]
 use kvmflow_engine::spawn_engine;
@@ -49,31 +48,12 @@ async fn forward_snapshots(
     }
 }
 
-async fn forward_keyboard_monitors(
-    mut monitors: tokio::sync::watch::Receiver<KeyboardMonitorState>,
-    mut publish: impl FnMut(KeyboardMonitorState),
-) {
-    while monitors.changed().await.is_ok() {
-        publish(monitors.borrow_and_update().clone());
-    }
-}
-
 fn start_snapshot_emitter(app: &tauri::AppHandle, engine: &EngineHandle) {
     let app = app.clone();
     let snapshots = engine.subscribe();
     tauri::async_runtime::spawn(forward_snapshots(snapshots, move |snapshot| {
         if let Err(error) = app.emit("engine://snapshot", snapshot) {
             tracing::error!(component = "snapshot-emitter", %error, "failed to emit engine snapshot");
-        }
-    }));
-}
-
-fn start_keyboard_emitter(app: &tauri::AppHandle, engine: &EngineHandle) {
-    let app = app.clone();
-    let monitors = engine.subscribe_keyboard();
-    tauri::async_runtime::spawn(forward_keyboard_monitors(monitors, move |monitor| {
-        if let Err(error) = app.emit("engine://keyboard", monitor) {
-            tracing::error!(component = "keyboard-emitter", %error, "failed to emit keyboard monitor");
         }
     }));
 }
@@ -185,7 +165,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
     app.manage(engine.clone());
     start_snapshot_emitter(app.handle(), &engine);
-    start_keyboard_emitter(app.handle(), &engine);
     menu_bar::create_menu_bar(app.handle(), &engine)?;
     window::ensure_main_window(app.handle(), &engine)?;
 
@@ -206,18 +185,52 @@ fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bu
     ])
 }
 
+fn show_existing_instance(app: &tauri::AppHandle) {
+    let Some(engine) = app.try_state::<EngineHandle>() else {
+        tracing::warn!(component = "single-instance", "engine state is not ready");
+        return;
+    };
+    match window::ensure_main_window(app, engine.inner()) {
+        Ok(window) => {
+            if let Err(error) = window.show().and_then(|_| window.set_focus()) {
+                tracing::error!(
+                    component = "single-instance",
+                    %error,
+                    "failed to focus the existing Mac instance"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                component = "single-instance",
+                %error,
+                "failed to open the existing Mac instance"
+            );
+        }
+    }
+}
+
 pub fn run() {
-    let app = configure_builder(tauri::Builder::default().setup(setup))
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
+        |app, _arguments, _working_directory| show_existing_instance(app),
+    ));
+    let app = configure_builder(builder.setup(setup))
         .build(tauri::generate_context!())
         .expect("failed to build kvmFlow macOS application");
 
-    app.run(|_, event| {
-        if let tauri::RunEvent::ExitRequested {
+    app.run(|app, event| match event {
+        tauri::RunEvent::ExitRequested {
             code: None, api, ..
-        } = event
-        {
-            api.prevent_exit();
+        } => api.prevent_exit(),
+        tauri::RunEvent::Resumed => {
+            let engine = app.state::<EngineHandle>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = engine
+                    .send(kvmflow_engine::EngineCommand::RecoverConnectionNow)
+                    .await;
+            });
         }
+        _ => {}
     });
 }
 
@@ -281,17 +294,14 @@ mod tests {
     use std::{fs, path::Path};
 
     use kvmflow_diagnostics::{PreparedStorage, StorageLayout, StorageWarning};
-    use kvmflow_domain::{
-        BuildInfo, DiagnosticNotice, DiagnosticNoticeCode, EndpointRole, KeyAction, KeyUsage,
-        KeyboardMonitorState,
-    };
+    use kvmflow_domain::{BuildInfo, DiagnosticNotice, DiagnosticNoticeCode, EndpointRole};
     use plist::Value as PlistValue;
     use serde_json::{Value, json};
     use tokio::sync::{mpsc, watch};
 
     use super::{
-        LoggingGuardOwner, forward_keyboard_monitors, forward_snapshots, spawn_startup_engine,
-        storage_notice, test_support::snapshot,
+        LoggingGuardOwner, forward_snapshots, spawn_startup_engine, storage_notice,
+        test_support::snapshot,
     };
 
     fn project_path(path: &str) -> std::path::PathBuf {
@@ -357,25 +367,6 @@ mod tests {
 
         drop(snapshot_tx);
         forwarding.await.expect("join snapshot forwarding task");
-        assert_eq!(emitted_rx.recv().await, None);
-    }
-
-    #[tokio::test]
-    async fn keyboard_forwarding_emits_each_monitor_change_and_stops_with_sender() {
-        let initial = KeyboardMonitorState::default();
-        let mut pressed = initial.clone();
-        pressed.observe(KeyUsage::LEFT_GUI, KeyAction::Down);
-        let (monitor_tx, monitor_rx) = watch::channel(initial);
-        let (emitted_tx, mut emitted_rx) = mpsc::unbounded_channel();
-        let forwarding = tokio::spawn(forward_keyboard_monitors(monitor_rx, move |monitor| {
-            emitted_tx.send(monitor).expect("record keyboard monitor");
-        }));
-
-        monitor_tx.send(pressed.clone()).expect("send monitor");
-        assert_eq!(emitted_rx.recv().await, Some(pressed));
-
-        drop(monitor_tx);
-        forwarding.await.expect("join keyboard forwarding task");
         assert_eq!(emitted_rx.recv().await, None);
     }
 

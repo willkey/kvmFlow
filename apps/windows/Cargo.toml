@@ -25,6 +25,7 @@ kvmflow-engine.workspace = true
 kvmflow-platform-windows = { path = "../../crates/platform-windows" }
 kvmflow-transport = { path = "../../crates/transport" }
 tauri.workspace = true
+tauri-plugin-single-instance.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

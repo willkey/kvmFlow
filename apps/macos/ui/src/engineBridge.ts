@@ -2,9 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   parseAppSnapshot,
-  parseKeyboardMonitorState,
   type AppSnapshot,
-  type KeyboardMonitorState,
 } from "@kvmflow/ui-contracts";
 
 export async function getInitialSnapshot(): Promise<AppSnapshot> {
@@ -20,19 +18,6 @@ export async function listenForSnapshots(
       onSnapshot(parseAppSnapshot(event.payload));
     } catch {
       onMalformedSnapshot?.();
-    }
-  });
-}
-
-export async function listenForKeyboardMonitor(
-  onMonitor: (monitor: KeyboardMonitorState) => void,
-  onMalformedMonitor?: () => void,
-): Promise<UnlistenFn> {
-  return listen<unknown>("engine://keyboard", (event) => {
-    try {
-      onMonitor(parseKeyboardMonitorState(event.payload));
-    } catch {
-      onMalformedMonitor?.();
     }
   });
 }
@@ -53,8 +38,8 @@ export async function rejectPairing(): Promise<void> {
   return invoke("reject_pairing");
 }
 
-export async function setLocalControlAllowed(allowed: boolean): Promise<void> {
-  return invoke("set_local_control_allowed", { allowed });
+export async function setEmergencyStopActive(active: boolean): Promise<void> {
+  return invoke("set_local_control_allowed", { allowed: !active });
 }
 
 export async function refreshAccessibilityPermission(): Promise<void> {

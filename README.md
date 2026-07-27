@@ -1,37 +1,41 @@
 # kvmFlow
 
-kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制一台 Mac。它只传输输入事件，不传输屏幕、音频或文件，也不是远程桌面软件。
+kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制一台 Mac，并在两端同步剪贴板。它不传输屏幕或音频，也不是远程桌面软件。
 
-> 当前开发版本为 `0.1.5`。源码与安装包请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases/latest) 下载。请仅在可信局域网中使用，不要把监听端口暴露到互联网。
+> 当前预览版本为 `0.2.0`。源码与安装包请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases) 下载。请仅在可信局域网中使用，不要把监听端口暴露到互联网。
 
 ## 已实现
 
 - Windows 手动输入 Mac 的 IPv4 地址和端口，Mac 监听端口可在 `1024-65535` 范围内修改。
 - TLS 1.3 加密传输、双端六位码核对、长期设备身份和一对一可信设备持久化。
-- 一秒心跳、固定五秒自动重连、断线后立即恢复 Windows 本机输入。
-- Windows 原生键鼠捕获与屏蔽，macOS CoreGraphics 输入注入和辅助功能权限检查。
+- 一秒心跳、固定五秒自动重连、网络变化与睡眠唤醒后立即重试，断线后立即恢复 Windows 本机输入。
+- Windows 原生键鼠捕获与屏蔽，macOS IOHID/CoreGraphics 输入注入和辅助功能权限检查。
 - Windows 目标显示器与进入边缘配置、自动跨屏、从 Mac 相反边缘返回。
-- 键盘、鼠标移动、左右键、中键、侧键、滚轮和常用修饰键转换。
+- 通用 HID 按键状态传输、Windows 到 macOS 修饰键策略、鼠标移动、左右键、中键、侧键和滚轮；组合键不依赖逐条快捷键规则。
+- 默认双向同步文本、HTML、RTF、PNG 图片、文件和嵌套文件夹；剪贴板与控制使用相互独立、绑定同一可信会话的 TLS 通道。
+- Windows 保留最近 20 条剪贴板历史，支持重新复制、失效提示和清空；Mac 只展示同步状态。
+- Windows 支持关闭跨屏控制、前台全屏保护和显示器布局冲突检测；剪贴板同步不依赖跨屏控制开关。
+- Mac 可以紧急停止当前控制，Windows 会立即关闭边缘探测并恢复本机输入。
 - `Ctrl+Alt+Shift+F12` 紧急返回 Windows。
 - Windows 托盘、macOS 菜单栏、窗口关闭后后台运行。
-- 结构化日志、诊断报告和持续资源监控；日志不记录实际按键内容、鼠标轨迹、完整配对码或设备私钥。
+- 结构化日志、诊断报告、持续资源监控和 KVM 验收进度；日志不记录实际按键内容、鼠标轨迹、完整配对码或设备私钥。
 
 ## 暂未实现
 
-- 剪贴板同步、文件传输和跨设备拖放。
+- 跨设备直接拖放；当前文件同步通过系统剪贴板完成。
 - 自动发现、主机名连接和 IPv6。
 - 自定义键盘映射、按应用区分的键位方案和完整多语言界面。
 - 多台 Mac、并发会话、自动更新和正式安装器更新链路。
 
 ## 下载与安装
 
-请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases/latest) 下载最新版本。`v0.1.5` 是未签名预览版，会提供：
+请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases) 下载最新版本。`v0.2.0` 是未签名预览版，会提供：
 
-- Windows 10/11（x64）：`kvmFlow_0.1.5_windows_x64-setup-UNSIGNED.exe`。
-- macOS 12 或更高版本（Apple Silicon 与 Intel）：`kvmFlow_0.1.5_macos_universal-UNNOTARIZED.dmg`。
+- Windows 10/11（x64）：`kvmFlow_0.2.0_windows_x64-setup-UNSIGNED.exe`。
+- macOS 12 或更高版本（Apple Silicon 与 Intel）：`kvmFlow_0.2.0_macos_universal-UNNOTARIZED.dmg`。
 
 > [!WARNING]
-> `v0.1.5` 的 Windows 安装器没有代码签名；macOS DMG 仅使用 ad-hoc 签名，没有 Apple Developer ID 签名和公证。因此 Windows SmartScreen / Smart App Control 或 macOS 安全机制可能阻止安装或打开。请只从本项目 GitHub Releases 下载，并先核对 SHA-256；不能接受该风险时，请等待后续签名版本。
+> `v0.2.0` 的 Windows 安装器没有代码签名；macOS DMG 仅使用 ad-hoc 签名，没有 Apple Developer ID 签名和公证。因此 Windows SmartScreen / Smart App Control 或 macOS 安全机制可能阻止安装或打开。请只从本项目 GitHub Releases 下载，并先核对 SHA-256；不能接受该风险时，请等待后续签名版本。
 
 Windows 出现 Microsoft Defender SmartScreen 提示时，只有确认下载来源和 SHA-256 无误后才继续；若界面提供“更多信息 -> 仍要运行”，可自行选择。启用了 Smart App Control 的设备可能直接拦截未签名应用且不提供单个应用放行，此时建议等待签名版本，不要为了安装本软件关闭系统级保护。详见 [Microsoft Smart App Control 说明](https://support.microsoft.com/en-US/Windows/Security/Threat-Malware-Protection/smart-app-control-frequently-asked-questions)。
 
@@ -40,11 +44,11 @@ macOS 首次打开时若被阻止，请先尝试打开一次，再进入“系�
 下载后可使用同名 `.sha256` 文件核对完整性：
 
 ```powershell
-certutil -hashfile .\kvmFlow_0.1.5_windows_x64-setup-UNSIGNED.exe SHA256
+certutil -hashfile .\kvmFlow_0.2.0_windows_x64-setup-UNSIGNED.exe SHA256
 ```
 
 ```sh
-shasum -a 256 kvmFlow_0.1.5_macos_universal-UNNOTARIZED.dmg
+shasum -a 256 kvmFlow_0.2.0_macos_universal-UNNOTARIZED.dmg
 ```
 
 ## 项目结构
@@ -115,6 +119,8 @@ scripts/setup-local-macos-signing.sh
 scripts/package-baseline-macos.sh
 ```
 
+本地签名身份的私钥和证书保存在项目目录外的 `~/Library/Application Support/kvmFlow Development Signing/`。打包脚本使用固定版本的 `rcodesign` 直接读取 PEM 文件，不导入或信任任何钥匙串证书；连续构建复用同一私钥，不会因签名身份变化反复重置辅助功能授权。首次使用需安装 `cargo install apple-codesign --version 0.29.0 --locked`。
+
 本地开发签名不等同于 Apple Developer ID 签名或公证，不应作为面向其他用户的正式 macOS 发布签名。Windows 未签名构建也可能触发 SmartScreen 提示。
 
 维护者的候选包验收、签名配置和正式发布步骤见 [docs/RELEASING.md](docs/RELEASING.md)。
@@ -126,6 +132,8 @@ scripts/package-baseline-macos.sh
 3. 启动 Windows 应用，输入 Mac 的 IPv4 地址和端口并连接。
 4. 核对两端持续显示的六位配对码，分别确认后建立一对一信任关系。
 5. 在 Windows 选择目标显示器和 Mac 所在边缘，然后通过该边缘进入 Mac；从 Mac 相反边缘返回 Windows。
+
+`0.2.0` 使用 V4 协议，两端必须同时更新。配对成功后，两端系统剪贴板默认自动同步；复制文件或文件夹会先完整传输到远端缓存，再写入远端剪贴板。
 
 ## 本地数据与发布包
 
@@ -139,7 +147,9 @@ kvmFlow/
   diagnostics/
 ```
 
-`data/device-identity.json` 包含未加密的设备私钥。macOS 会把文件权限限制为仅当前用户可读写，Windows 使用所在目录继承的访问控制。复制、共享或备份整个运行目录前，请先确认其中不包含身份、配对、日志或诊断数据。
+`data/device-identity.json` 包含未加密的设备私钥。Windows 的 `data/clipboard-history/` 会保存最近 20 条剪贴板内容，`data/clipboard-cache/` 可能保存已接收的图片、文件和文件夹；Mac 的接收缓存也可能保留最近内容。这些数据均未额外加密。macOS 会把身份文件权限限制为仅当前用户可读写，Windows 使用所在目录继承的访问控制。复制、共享或备份整个运行目录前，请先确认其中不包含身份、配对、剪贴板、日志或诊断数据；可在 Windows 应用内清空剪贴板历史。
+
+文件和文件夹传输没有产品级容量上限。只与可信设备配对，并确保接收端有足够磁盘空间；大文件会一直占用缓存直到被历史和缓存清理策略淘汰。
 
 运行过的目录不能直接作为发布包。请把干净版本导出到一个不存在的新目录：
 
