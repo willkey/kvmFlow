@@ -15,7 +15,7 @@ pub use resources::{
 };
 pub use storage::{
     ExecutableKind, PreparedStorage, StorageError, StorageLayout, StorageWarning, prepare_storage,
-    resolve_install_root,
+    prepare_storage_root, resolve_install_root,
 };
 pub use validation::{
     BACKGROUND_CPU_BLOCKER, BACKGROUND_CPU_TARGET, BACKGROUND_MEMORY_BLOCKER,

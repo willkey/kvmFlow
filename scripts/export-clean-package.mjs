@@ -45,18 +45,19 @@ export async function exportCleanPackage(sourceRoot, destinationRoot, platform) 
       errorOnExist: true,
       force: false,
     });
-    await Promise.all(
-      ["data", "logs", "diagnostics"].map((directory) =>
-        mkdir(path.join(destination, directory)),
-      ),
-    );
-
-    const sourceBuildId = path.join(source, "build-id.txt");
-    try {
-      await copyFile(sourceBuildId, path.join(destination, "build-id.txt"));
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
-        throw error;
+    if (platform === "windows") {
+      await Promise.all(
+        ["data", "logs", "diagnostics"].map((directory) =>
+          mkdir(path.join(destination, directory)),
+        ),
+      );
+      const sourceBuildId = path.join(source, "build-id.txt");
+      try {
+        await copyFile(sourceBuildId, path.join(destination, "build-id.txt"));
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+          throw error;
+        }
       }
     }
 

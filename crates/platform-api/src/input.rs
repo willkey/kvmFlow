@@ -24,6 +24,7 @@ pub enum PlatformEvent {
     LocalEdgeReached { edge: ScreenEdge, position: f32 },
     TargetDisplayChanged { display_id: String },
     ForegroundFullscreenChanged { active: bool },
+    SystemResumed,
     ClipboardChanged(ClipboardPayload),
     ClipboardFailed(String),
     RemoteEdgeReached { position: f32 },

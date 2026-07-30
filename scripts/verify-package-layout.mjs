@@ -6,7 +6,10 @@ const PLATFORM_APPS = {
   macos: "kvmFlow.app",
   windows: "kvmFlow.exe",
 };
-const RUNTIME_DIRECTORIES = ["data", "logs", "diagnostics"];
+const RUNTIME_DIRECTORIES = {
+  macos: [],
+  windows: ["data", "logs", "diagnostics"],
+};
 
 export function verifyPackageLayout(root, platform) {
   const appName = PLATFORM_APPS[platform];
@@ -15,7 +18,8 @@ export function verifyPackageLayout(root, platform) {
   }
 
   const absoluteRoot = path.resolve(root);
-  const requiredPaths = [appName, ...RUNTIME_DIRECTORIES];
+  const runtimeDirectories = RUNTIME_DIRECTORIES[platform];
+  const requiredPaths = [appName, ...runtimeDirectories];
   for (const relativePath of requiredPaths) {
     const requiredPath = path.join(absoluteRoot, relativePath);
     if (!existsSync(requiredPath)) {
@@ -30,8 +34,8 @@ export function verifyCleanPackageLayout(root, platform) {
   const absoluteRoot = verifyPackageLayout(root, platform);
   const allowedEntries = new Set([
     PLATFORM_APPS[platform],
-    ...RUNTIME_DIRECTORIES,
-    "build-id.txt",
+    ...RUNTIME_DIRECTORIES[platform],
+    ...(platform === "windows" ? ["build-id.txt"] : []),
   ]);
   for (const entry of readdirSync(absoluteRoot)) {
     if (!allowedEntries.has(entry)) {
@@ -40,7 +44,7 @@ export function verifyCleanPackageLayout(root, platform) {
       );
     }
   }
-  for (const relativePath of RUNTIME_DIRECTORIES) {
+  for (const relativePath of RUNTIME_DIRECTORIES[platform]) {
     const directory = path.join(absoluteRoot, relativePath);
     if (readdirSync(directory).length !== 0) {
       throw new Error(`release package directory must be empty: ${directory}`);

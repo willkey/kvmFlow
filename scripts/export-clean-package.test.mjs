@@ -31,13 +31,7 @@ test("clean macOS export excludes identity, config, logs, and diagnostics", asyn
     await readFile(path.join(destination, "kvmFlow.app", "marker"), "utf8"),
     "app",
   );
-  assert.deepEqual(await readdir(path.join(destination, "data")), []);
-  assert.deepEqual(await readdir(path.join(destination, "logs")), []);
-  assert.deepEqual(await readdir(path.join(destination, "diagnostics")), []);
-  assert.equal(
-    await readFile(path.join(destination, "build-id.txt"), "utf8"),
-    "test-build\n",
-  );
+  assert.deepEqual(await readdir(destination), ["kvmFlow.app"]);
 });
 
 test("clean export refuses to merge into an existing destination", async (context) => {

@@ -1,4 +1,6 @@
-use kvmflow_diagnostics::{ExecutableKind, StorageWarning, prepare_storage, resolve_install_root};
+use kvmflow_diagnostics::{
+    ExecutableKind, StorageWarning, prepare_storage, prepare_storage_root, resolve_install_root,
+};
 use std::{fs, process};
 use tempfile::tempdir;
 
@@ -46,6 +48,23 @@ fn prepare_creates_data_logs_and_diagnostics() {
     assert!(prepared.layout.diagnostics_dir.is_dir());
     assert!(!prepared.layout.fallback_used);
     assert_eq!(prepared.warning, None);
+}
+
+#[test]
+fn explicit_storage_root_supports_standard_application_data_directories() {
+    let temp = tempdir().unwrap();
+    let root = temp
+        .path()
+        .join("Library/Application Support/com.kvmflow.endpoint");
+    let fallback = temp.path().join("fallback");
+
+    let prepared = prepare_storage_root(&root, &fallback).unwrap();
+
+    assert_eq!(prepared.layout.root, root);
+    assert!(prepared.layout.data_dir.is_dir());
+    assert!(prepared.layout.logs_dir.is_dir());
+    assert!(prepared.layout.diagnostics_dir.is_dir());
+    assert!(!prepared.layout.fallback_used);
 }
 
 #[test]

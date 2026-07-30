@@ -11,6 +11,10 @@ const MULTI_CLICK_DISTANCE: f64 = 4.0;
 const ACTIVE_MOUSE_MOVE_GAP: Duration = Duration::from_millis(100);
 const DELAYED_MOUSE_MOVE_GAP: Duration = Duration::from_millis(12);
 const BURST_MOUSE_MOVE_GAP: Duration = Duration::from_millis(2);
+#[cfg(any(target_os = "macos", test))]
+const POINTER_SYNC_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(any(target_os = "macos", test))]
+const POINTER_SYNC_TOLERANCE: f64 = 128.0;
 const DEVICE_LEFT_CONTROL_FLAG: u64 = 0x0000_0001;
 const DEVICE_LEFT_SHIFT_FLAG: u64 = 0x0000_0002;
 const DEVICE_RIGHT_SHIFT_FLAG: u64 = 0x0000_0004;
@@ -58,6 +62,8 @@ pub struct MacInjectionState {
     pointer_x: f64,
     pointer_y: f64,
     active_pointer: Option<ActiveRemotePointer>,
+    last_pointer_sync_check_at: Option<Instant>,
+    pointer_warp_fallback: bool,
     held_keys: HashSet<KeyUsage>,
     held_buttons: HashSet<MouseButton>,
     click_tracker: ClickTracker,
@@ -74,6 +80,8 @@ impl MacInjectionState {
                 {
                     return Ok(InjectionOutcome::Applied);
                 }
+                let now = Instant::now();
+                self.reconcile_pointer_with_system(now)?;
                 self.pointer_x += f64::from(dx);
                 self.pointer_y += f64::from(dy);
                 let return_position = self.active_pointer.as_mut().and_then(|pointer| {
@@ -88,7 +96,7 @@ impl MacInjectionState {
                         pointer.bounds.clamp(self.pointer_x, self.pointer_y);
                 }
                 self.post_mouse_move()?;
-                self.stats.record_mouse_move(Instant::now());
+                self.stats.record_mouse_move(now);
                 if let Some(position) = return_position {
                     return Ok(InjectionOutcome::ReturnEdgeReached { position });
                 }
@@ -188,6 +196,7 @@ impl MacInjectionState {
             return_armed: false,
             return_pending: false,
         });
+        self.pointer_warp_fallback = false;
         let pointer_x = self.pointer_x;
         let pointer_y = self.pointer_y;
         let source = self.remote_event_source_ref()?;
@@ -198,7 +207,9 @@ impl MacInjectionState {
             MouseMoveKind::Moved,
             0,
             ModifierState::default(),
-        )
+        )?;
+        self.last_pointer_sync_check_at = Some(Instant::now());
+        Ok(())
     }
 
     pub fn release_all(&mut self) -> Result<(), InjectionError> {
@@ -243,6 +254,8 @@ impl MacInjectionState {
             .log_and_reset(held_keys_released, held_buttons_released);
         self.click_tracker.reset();
         self.active_pointer = None;
+        self.last_pointer_sync_check_at = None;
+        self.pointer_warp_fallback = false;
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -273,7 +286,54 @@ impl MacInjectionState {
         let pointer_y = self.pointer_y;
         let modifiers = ModifierState::from_held_keys(&self.held_keys);
         let source = self.remote_event_source_ref()?;
-        post_mouse_move(source, pointer_x, pointer_y, kind, click_count, modifiers)
+        post_mouse_move(source, pointer_x, pointer_y, kind, click_count, modifiers)?;
+        if self.pointer_warp_fallback {
+            warp_mouse_cursor(pointer_x, pointer_y)?;
+            self.stats.pointer_warp_events = self.stats.pointer_warp_events.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reconcile_pointer_with_system(&mut self, now: Instant) -> Result<(), InjectionError> {
+        if self.pointer_warp_fallback
+            || !pointer_sync_check_due(self.last_pointer_sync_check_at, now)
+        {
+            return Ok(());
+        }
+        self.last_pointer_sync_check_at = Some(now);
+        let source = self.remote_event_source()?;
+        let Ok((actual_x, actual_y)) = current_mouse_location(&source) else {
+            return Ok(());
+        };
+        if !pointer_position_drifted(
+            self.pointer_x,
+            self.pointer_y,
+            actual_x,
+            actual_y,
+            POINTER_SYNC_TOLERANCE,
+        ) {
+            return Ok(());
+        }
+        let (actual_x, actual_y) = self.active_pointer.map_or((actual_x, actual_y), |pointer| {
+            pointer.bounds.clamp(actual_x, actual_y)
+        });
+        self.pointer_x = actual_x;
+        self.pointer_y = actual_y;
+        self.pointer_warp_fallback = true;
+        self.stats.pointer_sync_repairs = self.stats.pointer_sync_repairs.saturating_add(1);
+        tracing::warn!(
+            component = "input",
+            stage = "mac_injection",
+            tolerance_px = POINTER_SYNC_TOLERANCE,
+            "Mac system cursor diverged from remote input; warp fallback enabled for this session"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn reconcile_pointer_with_system(&mut self, _now: Instant) -> Result<(), InjectionError> {
+        Ok(())
     }
 
     fn remote_event_source(&mut self) -> Result<RemoteEventSource, InjectionError> {
@@ -524,6 +584,8 @@ struct InputInjectionStats {
     mouse_move_max_active_interval_us: u64,
     mouse_move_delayed_intervals: u64,
     mouse_move_burst_intervals: u64,
+    pointer_sync_repairs: u64,
+    pointer_warp_events: u64,
     last_mouse_move_at: Option<Instant>,
 }
 
@@ -613,6 +675,8 @@ impl InputInjectionStats {
             mouse_move_max_active_interval_us = self.mouse_move_max_active_interval_us,
             mouse_move_delayed_intervals = self.mouse_move_delayed_intervals,
             mouse_move_burst_intervals = self.mouse_move_burst_intervals,
+            pointer_sync_repairs = self.pointer_sync_repairs,
+            pointer_warp_events = self.pointer_warp_events,
             held_keys_released,
             held_buttons_released,
             "Mac input injection session summary"
@@ -806,6 +870,46 @@ enum MouseMoveKind {
     LeftDrag,
     RightDrag,
     OtherDrag(MouseButton),
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn pointer_sync_check_due(last_check: Option<Instant>, now: Instant) -> bool {
+    last_check.is_none_or(|last_check| {
+        now.saturating_duration_since(last_check) >= POINTER_SYNC_CHECK_INTERVAL
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn pointer_position_drifted(
+    expected_x: f64,
+    expected_y: f64,
+    actual_x: f64,
+    actual_y: f64,
+    tolerance: f64,
+) -> bool {
+    (expected_x - actual_x).abs() > tolerance || (expected_y - actual_y).abs() > tolerance
+}
+
+#[cfg(target_os = "macos")]
+fn current_mouse_location(source: &RemoteEventSource) -> Result<(f64, f64), InjectionError> {
+    use core_graphics::event::CGEvent;
+
+    let event = CGEvent::new(source.clone()).map_err(|_| InjectionError::Unavailable)?;
+    let location = event.location();
+    Ok((location.x, location.y))
+}
+
+#[cfg(target_os = "macos")]
+fn warp_mouse_cursor(x: f64, y: f64) -> Result<(), InjectionError> {
+    use core_graphics::{display::CGDisplay, geometry::CGPoint};
+
+    CGDisplay::warp_mouse_cursor_position(CGPoint::new(x, y))
+        .map_err(|_| InjectionError::Unavailable)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn warp_mouse_cursor(_x: f64, _y: f64) -> Result<(), InjectionError> {
+    Err(InjectionError::Unavailable)
 }
 
 #[cfg(target_os = "macos")]
@@ -1486,6 +1590,39 @@ mod tests {
         assert_eq!(stats.mouse_move_max_active_interval_us, 20_000);
         assert_eq!(stats.mouse_move_delayed_intervals, 1);
         assert_eq!(stats.mouse_move_burst_intervals, 1);
+    }
+
+    #[test]
+    fn pointer_sync_check_is_rate_limited() {
+        let started = Instant::now();
+
+        assert!(pointer_sync_check_due(None, started));
+        assert!(!pointer_sync_check_due(
+            Some(started),
+            started + POINTER_SYNC_CHECK_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(pointer_sync_check_due(
+            Some(started),
+            started + POINTER_SYNC_CHECK_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn pointer_sync_ignores_small_delivery_lag_but_detects_stalls() {
+        assert!(!pointer_position_drifted(
+            500.0,
+            400.0,
+            500.0 + POINTER_SYNC_TOLERANCE,
+            400.0 - POINTER_SYNC_TOLERANCE,
+            POINTER_SYNC_TOLERANCE,
+        ));
+        assert!(pointer_position_drifted(
+            500.0,
+            400.0,
+            500.0 + POINTER_SYNC_TOLERANCE + 1.0,
+            400.0,
+            POINTER_SYNC_TOLERANCE,
+        ));
     }
 
     #[test]

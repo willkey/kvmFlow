@@ -22,11 +22,11 @@
 
 ## 本地敏感文件
 
-`data/device-identity.json` 保存未加密的设备私钥，泄露后可能导致设备身份被冒用。`data/config.json` 保存连接和可信设备配置。Windows 的 `data/clipboard-history/` 会保存最近 20 条剪贴板正文、图片和文件引用；两端的 `data/clipboard-cache/` 可能保存接收的图片、文件和文件夹。日志及诊断文件可能包含设备名称、局域网地址和运行环境信息。
+`data/device-identity.json` 保存未加密的设备私钥，泄露后可能导致设备身份被冒用。`data/config.json` 保存连接和可信设备配置。两端的 `data/clipboard-history/` 会保存最近 20 条剪贴板正文、图片和文件引用，`data/clipboard-cache/` 可能保存接收的图片、文件和文件夹。日志及诊断文件可能包含设备名称、局域网地址和运行环境信息。Windows 的这些数据位于 EXE 同级目录；macOS 位于 `~/Library/Application Support/com.kvmflow.endpoint/`。
 
-剪贴板文件传输不设产品级容量上限。已配对设备可以持续占用接收端磁盘空间，因此应只在可信局域网中与可信设备配对，并监控可用磁盘空间。Windows 用户可以在应用内清空剪贴板历史；删除整个运行目录前应先退出应用。
+剪贴板文件传输不设产品级容量上限。已配对设备可以持续占用接收端磁盘空间，因此应只在可信局域网中与可信设备配对，并监控可用磁盘空间。删除整个运行目录或应用数据目录前应先退出应用。
 
-不要提交或公开 `data/`、`logs/`、`diagnostics/`、`dist/`、真机测试结果或整个运行目录。对外分发二进制时必须使用 README 中的干净导出流程，并再次确认导出目录中的三个运行数据目录均为空。
+不要提交或公开 `data/`、`logs/`、`diagnostics/`、`dist/`、真机测试结果或整个运行目录。对外分发二进制时必须使用 README 中的干净导出流程；Windows 导出目录中的三个运行数据目录必须为空，macOS 导出目录只能包含 `kvmFlow.app`。
 
 ## 发布签名
 

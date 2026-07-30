@@ -2,7 +2,7 @@
 
 kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制一台 Mac，并在两端同步剪贴板。它不传输屏幕或音频，也不是远程桌面软件。
 
-> 当前预览版本为 `0.2.0`。源码与安装包请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases) 下载。请仅在可信局域网中使用，不要把监听端口暴露到互联网。
+> 当前预览版本为 `0.2.1`。源码与安装包请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases) 下载。请仅在可信局域网中使用，不要把监听端口暴露到互联网。
 
 ## 已实现
 
@@ -13,7 +13,7 @@ kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制�
 - Windows 目标显示器与进入边缘配置、自动跨屏、从 Mac 相反边缘返回。
 - 通用 HID 按键状态传输、Windows 到 macOS 修饰键策略、鼠标移动、左右键、中键、侧键和滚轮；组合键不依赖逐条快捷键规则。
 - 默认双向同步文本、HTML、RTF、PNG 图片、文件和嵌套文件夹；剪贴板与控制使用相互独立、绑定同一可信会话的 TLS 通道。
-- Windows 保留最近 20 条剪贴板历史，支持重新复制、失效提示和清空；Mac 只展示同步状态。
+- Windows 和 Mac 各自持久化最近 20 条剪贴板历史；点击 Windows 托盘或 Mac 菜单栏图标即可快速查看并重新复制，Windows 主界面另提供失效提示和清空。
 - Windows 支持关闭跨屏控制、前台全屏保护和显示器布局冲突检测；剪贴板同步不依赖跨屏控制开关。
 - Mac 可以紧急停止当前控制，Windows 会立即关闭边缘探测并恢复本机输入。
 - `Ctrl+Alt+Shift+F12` 紧急返回 Windows。
@@ -29,13 +29,13 @@ kvmFlow 是一款局域网软件 KVM：使用 Windows 的键盘和鼠标控制�
 
 ## 下载与安装
 
-请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases) 下载最新版本。`v0.2.0` 是未签名预览版，会提供：
+请从 [GitHub Releases](https://github.com/willkey/kvmFlow/releases) 下载最新版本。`v0.2.1` 是未签名预览版，会提供：
 
-- Windows 10/11（x64）：`kvmFlow_0.2.0_windows_x64-setup-UNSIGNED.exe`。
-- macOS 12 或更高版本（Apple Silicon 与 Intel）：`kvmFlow_0.2.0_macos_universal-UNNOTARIZED.dmg`。
+- Windows 10/11（x64）：`kvmFlow_0.2.1_windows_x64-setup-UNSIGNED.exe`。
+- macOS 12 或更高版本（Apple Silicon 与 Intel）：`kvmFlow_0.2.1_macos_universal-UNNOTARIZED.dmg`。
 
 > [!WARNING]
-> `v0.2.0` 的 Windows 安装器没有代码签名；macOS DMG 仅使用 ad-hoc 签名，没有 Apple Developer ID 签名和公证。因此 Windows SmartScreen / Smart App Control 或 macOS 安全机制可能阻止安装或打开。请只从本项目 GitHub Releases 下载，并先核对 SHA-256；不能接受该风险时，请等待后续签名版本。
+> `v0.2.1` 的 Windows 安装器没有代码签名；macOS DMG 仅使用 ad-hoc 签名，没有 Apple Developer ID 签名和公证。因此 Windows SmartScreen / Smart App Control 或 macOS 安全机制可能阻止安装或打开。请只从本项目 GitHub Releases 下载，并先核对 SHA-256；不能接受该风险时，请等待后续签名版本。
 
 Windows 出现 Microsoft Defender SmartScreen 提示时，只有确认下载来源和 SHA-256 无误后才继续；若界面提供“更多信息 -> 仍要运行”，可自行选择。启用了 Smart App Control 的设备可能直接拦截未签名应用且不提供单个应用放行，此时建议等待签名版本，不要为了安装本软件关闭系统级保护。详见 [Microsoft Smart App Control 说明](https://support.microsoft.com/en-US/Windows/Security/Threat-Malware-Protection/smart-app-control-frequently-asked-questions)。
 
@@ -44,11 +44,11 @@ macOS 首次打开时若被阻止，请先尝试打开一次，再进入“系�
 下载后可使用同名 `.sha256` 文件核对完整性：
 
 ```powershell
-certutil -hashfile .\kvmFlow_0.2.0_windows_x64-setup-UNSIGNED.exe SHA256
+certutil -hashfile .\kvmFlow_0.2.1_windows_x64-setup-UNSIGNED.exe SHA256
 ```
 
 ```sh
-shasum -a 256 kvmFlow_0.2.0_macos_universal-UNNOTARIZED.dmg
+shasum -a 256 kvmFlow_0.2.1_macos_universal-UNNOTARIZED.dmg
 ```
 
 ## 项目结构
@@ -133,21 +133,28 @@ scripts/package-baseline-macos.sh
 4. 核对两端持续显示的六位配对码，分别确认后建立一对一信任关系。
 5. 在 Windows 选择目标显示器和 Mac 所在边缘，然后通过该边缘进入 Mac；从 Mac 相反边缘返回 Windows。
 
-`0.2.0` 使用 V4 协议，两端必须同时更新。配对成功后，两端系统剪贴板默认自动同步；复制文件或文件夹会先完整传输到远端缓存，再写入远端剪贴板。
+`0.2.1` 仍使用 V4 协议，兼容现有 `0.2.0` 配对与配置数据；建议两端同时更新以获得全部修复。配对成功后，两端系统剪贴板默认自动同步；复制文件或文件夹会先完整传输到远端缓存，再写入远端剪贴板。
 
 ## 本地数据与发布包
 
-运行数据保存在应用同级目录，而不是写入可执行文件或 macOS `.app` 内部：
+Windows 运行数据保存在 EXE 同级目录。macOS 安装目录只保留单个 `kvmFlow.app`，运行数据保存在当前用户的标准应用数据目录，不写入 `.app` 包：
 
 ```text
-kvmFlow/
-  kvmFlow.exe 或 kvmFlow.app
+Windows/
+  kvmFlow.exe
   data/
   logs/
   diagnostics/
+
+macOS/
+  /Applications/kvmFlow.app
+  ~/Library/Application Support/com.kvmflow.endpoint/
+    data/
+    logs/
+    diagnostics/
 ```
 
-`data/device-identity.json` 包含未加密的设备私钥。Windows 的 `data/clipboard-history/` 会保存最近 20 条剪贴板内容，`data/clipboard-cache/` 可能保存已接收的图片、文件和文件夹；Mac 的接收缓存也可能保留最近内容。这些数据均未额外加密。macOS 会把身份文件权限限制为仅当前用户可读写，Windows 使用所在目录继承的访问控制。复制、共享或备份整个运行目录前，请先确认其中不包含身份、配对、剪贴板、日志或诊断数据；可在 Windows 应用内清空剪贴板历史。
+`data/device-identity.json` 包含未加密的设备私钥。两端的 `data/clipboard-history/` 会保存最近 20 条剪贴板内容，`data/clipboard-cache/` 可能保存已接收的图片、文件和文件夹。这些数据均未额外加密。macOS 会把身份文件权限限制为仅当前用户可读写，Windows 使用所在目录继承的访问控制。复制、共享或备份整个运行目录前，请先确认其中不包含身份、配对、剪贴板、日志或诊断数据。
 
 文件和文件夹传输没有产品级容量上限。只与可信设备配对，并确保接收端有足够磁盘空间；大文件会一直占用缓存直到被历史和缓存清理策略淘汰。
 
@@ -157,7 +164,7 @@ kvmFlow/
 node scripts/export-clean-package.mjs <运行目录> <新发布目录> <windows|macos>
 ```
 
-导出器只复制应用和构建 ID，并创建空的 `data`、`logs`、`diagnostics` 目录。
+导出器在 macOS 只复制 `kvmFlow.app`；Windows 会复制 EXE 和构建 ID，并创建空的 `data`、`logs`、`diagnostics` 目录。
 
 ## 安全与贡献
 

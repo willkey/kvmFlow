@@ -11,6 +11,7 @@ use crate::SecureChannel;
 
 pub(crate) const BULK_CHUNK_BYTES: usize = 256 * 1024;
 const MAX_BULK_FRAME_BYTES: usize = BULK_CHUNK_BYTES + 64 * 1024;
+const READ_CHUNK_BYTES: usize = 32 * 1024;
 const OFFER_FRAME: u8 = 1;
 const CHUNK_FRAME: u8 = 2;
 const COMPLETE_FRAME: u8 = 3;
@@ -32,17 +33,12 @@ pub(crate) enum BulkMessage {
 pub(crate) struct BulkChannel {
     stream: TlsStream<TcpStream>,
     buffered: Vec<u8>,
-    buffered_offset: usize,
 }
 
 impl BulkChannel {
     pub(crate) fn from_secure(channel: SecureChannel) -> Self {
         let (stream, buffered) = channel.into_raw_parts();
-        Self {
-            stream,
-            buffered,
-            buffered_offset: 0,
-        }
+        Self { stream, buffered }
     }
 
     pub(crate) async fn send(&mut self, message: &BulkMessage) -> Result<(), BulkProtocolError> {
@@ -91,37 +87,38 @@ impl BulkChannel {
     }
 
     pub(crate) async fn receive(&mut self) -> Result<BulkMessage, BulkProtocolError> {
-        let mut length_bytes = [0_u8; 4];
-        self.read_exact(&mut length_bytes).await?;
-        let length = u32::from_be_bytes(length_bytes) as usize;
-        if length == 0 || length > MAX_BULK_FRAME_BYTES {
-            return Err(BulkProtocolError::InvalidFrameLength(length));
-        }
-        let mut frame = vec![0_u8; length];
-        self.read_exact(&mut frame).await?;
-        decode_message(frame)
-    }
-
-    async fn read_exact(&mut self, destination: &mut [u8]) -> Result<(), std::io::Error> {
-        let buffered_remaining = self.buffered.len().saturating_sub(self.buffered_offset);
-        let buffered_length = buffered_remaining.min(destination.len());
-        if buffered_length > 0 {
-            let buffered_end = self.buffered_offset + buffered_length;
-            destination[..buffered_length]
-                .copy_from_slice(&self.buffered[self.buffered_offset..buffered_end]);
-            self.buffered_offset = buffered_end;
-            if self.buffered_offset == self.buffered.len() {
-                self.buffered.clear();
-                self.buffered_offset = 0;
+        loop {
+            if let Some(message) = take_buffered_message(&mut self.buffered)? {
+                return Ok(message);
             }
+
+            let mut chunk = [0_u8; READ_CHUNK_BYTES];
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            self.buffered.extend_from_slice(&chunk[..read]);
         }
-        if buffered_length < destination.len() {
-            self.stream
-                .read_exact(&mut destination[buffered_length..])
-                .await?;
-        }
-        Ok(())
     }
+}
+
+fn take_buffered_message(buffered: &mut Vec<u8>) -> Result<Option<BulkMessage>, BulkProtocolError> {
+    let Some(length_bytes) = buffered.get(..4) else {
+        return Ok(None);
+    };
+    let length = u32::from_be_bytes(
+        length_bytes
+            .try_into()
+            .expect("four-byte frame length checked"),
+    ) as usize;
+    validate_frame_length(length)?;
+    let frame_end = 4 + length;
+    if buffered.len() < frame_end {
+        return Ok(None);
+    }
+    let frame = buffered[4..frame_end].to_vec();
+    buffered.drain(..frame_end);
+    decode_message(frame).map(Some)
 }
 
 #[cfg(test)]
@@ -360,5 +357,58 @@ mod tests {
             decode_message(encoded),
             Err(BulkProtocolError::InvalidChunkLength(3))
         ));
+    }
+
+    #[test]
+    fn buffered_decoder_preserves_partial_frames_across_poll_cancellation() {
+        let message = BulkMessage::Complete {
+            transfer_id: "transfer-1".into(),
+        };
+        let frame = encode_message(&message).expect("encode");
+        let mut wire = (frame.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(&frame);
+        let mut buffered = wire[..4].to_vec();
+
+        assert_eq!(
+            take_buffered_message(&mut buffered).expect("partial length"),
+            None
+        );
+        buffered.extend_from_slice(&wire[4..8]);
+        assert_eq!(
+            take_buffered_message(&mut buffered).expect("partial payload"),
+            None
+        );
+        buffered.extend_from_slice(&wire[8..]);
+        assert_eq!(
+            take_buffered_message(&mut buffered).expect("complete frame"),
+            Some(message)
+        );
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn buffered_decoder_keeps_the_next_complete_frame() {
+        let first = BulkMessage::Complete {
+            transfer_id: "first".into(),
+        };
+        let second = BulkMessage::Complete {
+            transfer_id: "second".into(),
+        };
+        let mut buffered = Vec::new();
+        for message in [&first, &second] {
+            let frame = encode_message(message).expect("encode");
+            buffered.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+            buffered.extend_from_slice(&frame);
+        }
+
+        assert_eq!(
+            take_buffered_message(&mut buffered).expect("first frame"),
+            Some(first)
+        );
+        assert_eq!(
+            take_buffered_message(&mut buffered).expect("second frame"),
+            Some(second)
+        );
+        assert!(buffered.is_empty());
     }
 }

@@ -85,8 +85,14 @@ pub fn prepare_storage(
     fallback_base: &Path,
 ) -> Result<PreparedStorage, StorageError> {
     let requested = resolve_install_root(executable, kind)?;
+    prepare_storage_root(&requested, fallback_base)
+}
 
-    match create_layout(requested.clone(), false) {
+pub fn prepare_storage_root(
+    requested: &Path,
+    fallback_base: &Path,
+) -> Result<PreparedStorage, StorageError> {
+    match create_layout(requested.to_path_buf(), false) {
         Ok(layout) => Ok(PreparedStorage {
             layout,
             warning: None,
@@ -97,12 +103,12 @@ pub fn prepare_storage(
                 Ok(layout) => Ok(PreparedStorage {
                     layout,
                     warning: Some(StorageWarning::PrimaryRootUnavailable {
-                        requested,
+                        requested: requested.to_path_buf(),
                         fallback,
                     }),
                 }),
                 Err(fallback_error) => Err(StorageError::FallbackRootUnavailable {
-                    requested,
+                    requested: requested.to_path_buf(),
                     fallback,
                     primary_error,
                     fallback_error,

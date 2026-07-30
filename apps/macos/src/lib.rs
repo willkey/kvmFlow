@@ -1,11 +1,15 @@
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use kvmflow_diagnostics::{
     ExecutableKind, LoggingGuard, PERSIST_INTERVAL, PreparedStorage, RetentionPolicy,
     SAMPLE_INTERVAL, SysinfoResourceSampler, ValidationMonitor, ValidationStore, init_file_logging,
-    prepare_storage,
+    prepare_storage_root, resolve_install_root,
 };
 use kvmflow_domain::{
     AppSnapshot, BuildInfo, DiagnosticNotice, DiagnosticNoticeCode, EndpointRole,
@@ -28,9 +32,128 @@ struct LoggingGuardOwner {
 fn storage_notice(prepared: &PreparedStorage) -> Option<DiagnosticNotice> {
     prepared.warning.as_ref().map(|_| DiagnosticNotice {
         code: DiagnosticNoticeCode::StorageFallback,
-        message: "安装目录不可写，日志已切换到备用目录".into(),
+        message: "应用数据目录不可写，日志已切换到备用目录".into(),
         path: Some(prepared.layout.root.display().to_string()),
     })
+}
+
+fn migrate_legacy_runtime(legacy_root: &Path, standard_root: &Path) -> io::Result<bool> {
+    if legacy_root == standard_root
+        || !legacy_root.join("data/device-identity.json").is_file()
+        || standard_root.join("data/device-identity.json").is_file()
+    {
+        return Ok(false);
+    }
+
+    let legacy_directories = ["data", "logs", "diagnostics"]
+        .into_iter()
+        .map(|directory| legacy_root.join(directory))
+        .filter(|source| source.is_dir())
+        .collect::<Vec<_>>();
+    for source in &legacy_directories {
+        validate_migration_tree(source)?;
+    }
+
+    if standard_root.exists() {
+        if fs::read_dir(standard_root)?.next().transpose()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "standard application data directory is not empty",
+            ));
+        }
+        fs::remove_dir(standard_root)?;
+    }
+    let parent = standard_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "standard application data directory has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let directory_name = standard_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("kvmflow");
+    let staging_root = parent.join(format!(
+        ".{directory_name}-migration-{}",
+        std::process::id()
+    ));
+    if staging_root.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "application data migration staging directory already exists",
+        ));
+    }
+    fs::create_dir(&staging_root)?;
+    let migration_result = (|| {
+        for source in &legacy_directories {
+            let destination = staging_root.join(
+                source
+                    .file_name()
+                    .expect("legacy runtime directory has a name"),
+            );
+            copy_migration_tree(source, &destination)?;
+        }
+        fs::rename(&staging_root, standard_root)
+    })();
+    if let Err(error) = migration_result {
+        let _ = fs::remove_dir_all(&staging_root);
+        return Err(error);
+    }
+
+    for source in legacy_directories {
+        let _ = fs::remove_dir_all(source);
+    }
+    Ok(true)
+}
+
+fn validate_migration_tree(source: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy runtime data contains a symbolic link",
+            ));
+        }
+        if file_type.is_dir() {
+            validate_migration_tree(&entry.path())?;
+        } else if !file_type.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy runtime data contains an unsupported file type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copy_migration_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy runtime data contains a symbolic link",
+            ));
+        }
+        if file_type.is_dir() {
+            copy_migration_tree(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(source_path, destination_path)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy runtime data contains an unsupported file type",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn with_tauri_runtime<T>(operation: impl FnOnce() -> T) -> T {
@@ -132,12 +255,20 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("failed to resolve executable path: {error}");
         error
     })?;
+    let storage_root = app.path().app_data_dir().map_err(|error| {
+        eprintln!("failed to resolve standard application data path: {error}");
+        error
+    })?;
+    let legacy_root = resolve_install_root(&executable, ExecutableKind::MacAppBundle)?;
+    let migrated = migrate_legacy_runtime(&legacy_root, &storage_root).map_err(|error| {
+        eprintln!("failed to migrate legacy application data: {error}");
+        error
+    })?;
     let fallback_base = std::env::temp_dir();
-    let prepared = prepare_storage(&executable, ExecutableKind::MacAppBundle, &fallback_base)
-        .map_err(|error| {
-            eprintln!("failed to prepare application storage: {error}");
-            error
-        })?;
+    let prepared = prepare_storage_root(&storage_root, &fallback_base).map_err(|error| {
+        eprintln!("failed to prepare application storage: {error}");
+        error
+    })?;
     let logging_guard =
         init_file_logging(&prepared.layout, RetentionPolicy::default()).map_err(|error| {
             eprintln!("failed to initialize file logging: {error}");
@@ -150,6 +281,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         build_id = %build.build_id,
         storage_root = %prepared.layout.root.display(),
         storage_fallback = prepared.layout.fallback_used,
+        legacy_storage_migrated = migrated,
         "kvmFlow started"
     );
     let diagnostic_notice = storage_notice(&prepared);
@@ -300,8 +432,8 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use super::{
-        LoggingGuardOwner, forward_snapshots, spawn_startup_engine, storage_notice,
-        test_support::snapshot,
+        LoggingGuardOwner, forward_snapshots, migrate_legacy_runtime, spawn_startup_engine,
+        storage_notice, test_support::snapshot,
     };
 
     fn project_path(path: &str) -> std::path::PathBuf {
@@ -440,8 +572,86 @@ mod tests {
         let notice = storage_notice(&prepared).expect("fallback notice");
 
         assert_eq!(notice.code, DiagnosticNoticeCode::StorageFallback);
-        assert_eq!(notice.message, "安装目录不可写，日志已切换到备用目录");
+        assert_eq!(notice.message, "应用数据目录不可写，日志已切换到备用目录");
         assert_eq!(notice.path, Some(prepared_root.display().to_string()));
+    }
+
+    #[test]
+    fn legacy_runtime_migrates_once_to_standard_application_data() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let legacy = temp.path().join("legacy");
+        let standard = temp.path().join("standard");
+        fs::create_dir_all(legacy.join("data")).expect("create legacy data");
+        fs::create_dir_all(legacy.join("logs")).expect("create legacy logs");
+        fs::write(legacy.join("data/device-identity.json"), "identity").expect("write identity");
+        fs::write(legacy.join("data/config.json"), "config").expect("write config");
+        fs::write(legacy.join("logs/kvmflow.log"), "log").expect("write log");
+
+        assert!(migrate_legacy_runtime(&legacy, &standard).expect("migrate"));
+        assert_eq!(
+            fs::read_to_string(standard.join("data/device-identity.json")).expect("read identity"),
+            "identity"
+        );
+        assert_eq!(
+            fs::read_to_string(standard.join("data/config.json")).expect("read config"),
+            "config"
+        );
+        assert_eq!(
+            fs::read_to_string(standard.join("logs/kvmflow.log")).expect("read log"),
+            "log"
+        );
+        assert!(!legacy.join("data").exists());
+        assert!(!legacy.join("logs").exists());
+        assert!(!migrate_legacy_runtime(&legacy, &standard).expect("second migration"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_runtime_rejects_symbolic_links_before_moving_data() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let legacy = temp.path().join("legacy");
+        let standard = temp.path().join("standard");
+        fs::create_dir_all(legacy.join("data")).expect("create legacy data");
+        fs::write(legacy.join("data/device-identity.json"), "identity").expect("write identity");
+        symlink(
+            temp.path().join("outside"),
+            legacy.join("data/linked-outside"),
+        )
+        .expect("create symbolic link");
+
+        let error = migrate_legacy_runtime(&legacy, &standard).expect_err("reject symbolic link");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(legacy.join("data/device-identity.json").is_file());
+        assert!(!standard.exists());
+    }
+
+    #[test]
+    fn legacy_runtime_refuses_a_nonempty_destination_without_deleting_files() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let legacy = temp.path().join("legacy");
+        let standard = temp.path().join("standard");
+        fs::create_dir_all(legacy.join("data")).expect("create legacy data");
+        fs::create_dir_all(standard.join("data")).expect("create standard data");
+        fs::write(legacy.join("data/device-identity.json"), "legacy identity")
+            .expect("write identity");
+        fs::write(legacy.join("data/config.json"), "legacy config").expect("write legacy config");
+        fs::write(standard.join("data/config.json"), "standard config")
+            .expect("write standard config");
+
+        let error = migrate_legacy_runtime(&legacy, &standard).expect_err("reject destination");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(legacy.join("data/config.json")).expect("read legacy config"),
+            "legacy config"
+        );
+        assert_eq!(
+            fs::read_to_string(standard.join("data/config.json")).expect("read standard config"),
+            "standard config"
+        );
     }
 
     #[test]

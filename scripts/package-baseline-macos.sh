@@ -26,7 +26,6 @@ export KVMFLOW_BUILD_ID="$build_id"
 )
 scripts/sign-macos-app.sh "target/release/bundle/macos/kvmFlow.app"
 
-mkdir -p "$package_root/data" "$package_root/logs" "$package_root/diagnostics"
 if [[ ! -d "$package_root/kvmFlow.app" && -d "$previous_app" ]]; then
   mv "$previous_app" "$package_root/kvmFlow.app"
 elif [[ -d "$previous_app" ]]; then
@@ -57,5 +56,6 @@ if ! node scripts/verify-package-layout.mjs "$package_root" macos; then
 fi
 
 rm -rf "$previous_app"
-printf '%s\n' "$build_id" > "$package_root/build-id.txt"
+rm -f "$package_root/build-id.txt"
+rm -f "$package_root/.DS_Store"
 printf '%s\n' "$package_root"

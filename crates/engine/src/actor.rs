@@ -1253,6 +1253,15 @@ fn apply_platform_event(
                 "Windows foreground fullscreen state changed"
             );
         }
+        PlatformEvent::SystemResumed => {
+            tracing::info!(
+                component = "connection",
+                "Windows power event requested immediate KVM recovery"
+            );
+            actions
+                .runtime
+                .push(RuntimeCommand::RecoverNow(RecoveryTrigger::SystemResumed));
+        }
         PlatformEvent::ClipboardChanged(payload) => {
             tracing::info!(
                 component = "clipboard",
@@ -1841,6 +1850,18 @@ mod kvm_tests {
                 .iter()
                 .any(|command| matches!(command, PlatformCommand::SetEdgeSwitchEnabled(true)))
         );
+    }
+
+    #[test]
+    fn windows_power_resume_requests_immediate_connection_recovery() {
+        let (mut state, snapshots) = state(EndpointRole::WindowsController);
+
+        let actions = apply_platform_event(&mut state, &snapshots, PlatformEvent::SystemResumed);
+
+        assert!(actions.runtime.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::RecoverNow(RecoveryTrigger::SystemResumed)
+        )));
     }
 
     #[test]

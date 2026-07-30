@@ -23,14 +23,16 @@ test("macOS packaging ignores untracked transfer files and filemode noise", () =
   assert.doesNotMatch(script, /--sign -/);
 });
 
-test("macOS packaging replaces the app at a stable path and preserves runtime data", () => {
+test("macOS packaging leaves a single app after one-time runtime migration", () => {
   assert.match(script, /package_root="dist\/macos\/current"/);
   assert.doesNotMatch(script, /package_root="dist\/macos\/\$build_id"/);
-  assert.match(script, /mkdir -p "\$package_root\/data"/);
+  assert.doesNotMatch(script, /mkdir -p "\$package_root\/data"/);
+  assert.doesNotMatch(script, /rm -rf "\$package_root\/data"/);
   assert.match(script, /previous_app="\$package_root\/\.kvmFlow\.app\.previous"/);
   assert.match(script, /! -d "\$package_root\/kvmFlow\.app" && -d "\$previous_app"/);
   assert.match(script, /mv "\$next_app" "\$package_root\/kvmFlow\.app"/);
-  assert.match(script, /build-id\.txt/);
+  assert.match(script, /rm -f "\$package_root\/build-id\.txt"/);
+  assert.match(script, /rm -f "\$package_root\/\.DS_Store"/);
 });
 
 test("macOS packaging requires a stable signing identity", () => {

@@ -330,6 +330,14 @@ struct MacChannelServices<'a> {
     listener: &'a mut SecureListener,
     store: &'a ConfigStore,
     clipboard: &'a ClipboardMailbox,
+    history: &'a ClipboardHistoryStore,
+    events: &'a mpsc::Sender<RuntimeEvent>,
+}
+
+struct MacSessionServices<'a> {
+    store: &'a ConfigStore,
+    clipboard: &'a ClipboardMailbox,
+    history: &'a ClipboardHistoryStore,
     events: &'a mpsc::Sender<RuntimeEvent>,
 }
 
@@ -1528,6 +1536,10 @@ async fn run_macos_runtime(
     clipboard: ClipboardMailbox,
     events: mpsc::Sender<RuntimeEvent>,
 ) {
+    let history = ClipboardHistoryStore::new(store.data_dir());
+    if let Err(error) = history.prune_incoming_cache().await {
+        emit_clipboard_history_error(&events, error).await;
+    }
     emit(
         &events,
         RuntimeEvent::TrustedPeerLoaded {
@@ -1542,6 +1554,7 @@ async fn run_macos_runtime(
         },
     )
     .await;
+    publish_clipboard_history(&history, &events).await;
     let mut listener = match bind_macos_listener(&identity, &config).await {
         Ok(listener) => {
             emit(
@@ -1600,6 +1613,15 @@ async fn run_macos_runtime(
                     )
                     .await;
                 }
+                Some(RuntimeCommand::ClipboardUpdated) => {
+                    record_current_clipboard(&clipboard, &history, &events).await;
+                }
+                Some(RuntimeCommand::ActivateClipboardHistory(id)) => {
+                    activate_clipboard_history(&id, &clipboard, &history, &events).await;
+                }
+                Some(RuntimeCommand::ClearClipboardHistory) => {
+                    clear_clipboard_history(&history, &events).await;
+                }
                 Some(RuntimeCommand::Shutdown) | None => return,
                 _ => {}
             }
@@ -1624,6 +1646,7 @@ async fn run_macos_runtime(
                             listener: listener.as_mut().expect("listener checked"),
                             store: &store,
                             clipboard: &clipboard,
+                            history: &history,
                             events: &events,
                         };
                         match prepare_macos_channel(
@@ -1684,6 +1707,15 @@ async fn run_macos_runtime(
                             },
                         )
                         .await;
+                    }
+                    Some(RuntimeCommand::ClipboardUpdated) => {
+                        record_current_clipboard(&clipboard, &history, &events).await;
+                    }
+                    Some(RuntimeCommand::ActivateClipboardHistory(id)) => {
+                        activate_clipboard_history(&id, &clipboard, &history, &events).await;
+                    }
+                    Some(RuntimeCommand::ClearClipboardHistory) => {
+                        clear_clipboard_history(&history, &events).await;
                     }
                     Some(RuntimeCommand::Shutdown) | None => return,
                     _ => {}
@@ -1779,6 +1811,7 @@ async fn prepare_macos_channel(
         listener,
         store,
         clipboard,
+        history,
         events,
     } = services;
     let previous_trust = config.trusted_peer.clone();
@@ -1817,18 +1850,28 @@ async fn prepare_macos_channel(
         },
     )
     .await;
-    run_macos_session(channel, bulk, config, store, commands, clipboard, events).await
+    let services = MacSessionServices {
+        store,
+        clipboard,
+        history,
+        events,
+    };
+    run_macos_session(channel, bulk, config, commands, services).await
 }
 
 async fn run_macos_session(
     mut channel: SecureChannel,
     bulk: BulkChannel,
     config: &mut MacRuntimeConfig,
-    store: &ConfigStore,
     commands: &mut mpsc::Receiver<RuntimeCommand>,
-    clipboard: &ClipboardMailbox,
-    events: &mpsc::Sender<RuntimeEvent>,
+    services: MacSessionServices<'_>,
 ) -> ChannelOutcome {
+    let MacSessionServices {
+        store,
+        clipboard,
+        history,
+        events,
+    } = services;
     if let Err(error) = channel
         .send(ProtocolMessage::RemotePause {
             paused: config.local_policy == LocalControlPolicy::Paused,
@@ -1843,7 +1886,7 @@ async fn run_macos_session(
         clipboard.clone(),
         store.data_dir().to_owned(),
         true,
-        None,
+        Some(history.clone()),
         clipboard_update_rx,
         events.clone(),
     );
@@ -1916,7 +1959,15 @@ async fn run_macos_session(
                         }
                     }
                     Some(RuntimeCommand::ClipboardUpdated) => {
+                        record_current_clipboard(clipboard, history, events).await;
                         let _ = clipboard_updates.try_send(());
+                    }
+                    Some(RuntimeCommand::ActivateClipboardHistory(id)) => {
+                        activate_clipboard_history(&id, clipboard, history, events).await;
+                        let _ = clipboard_updates.try_send(());
+                    }
+                    Some(RuntimeCommand::ClearClipboardHistory) => {
+                        clear_clipboard_history(history, events).await;
                     }
                     Some(RuntimeCommand::RecoverNow(trigger)) => {
                         emit_recovery_trigger(events, trigger).await;

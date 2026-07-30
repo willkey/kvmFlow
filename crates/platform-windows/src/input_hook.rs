@@ -105,6 +105,31 @@ fn is_modifier_usage(usage: KeyUsage) -> bool {
 }
 
 #[cfg(any(windows, test))]
+fn update_locally_visible_modifier(
+    visible: &mut std::collections::HashSet<u16>,
+    virtual_key: u16,
+    intercepted: bool,
+    down: bool,
+) {
+    if intercepted || !is_windows_modifier_virtual_key(virtual_key) {
+        return;
+    }
+    if down {
+        visible.insert(virtual_key);
+    } else {
+        visible.remove(&virtual_key);
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_modifier_virtual_key(virtual_key: u16) -> bool {
+    matches!(
+        virtual_key,
+        VK_LCONTROL | VK_RCONTROL | VK_LSHIFT | VK_RSHIFT | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN
+    )
+}
+
+#[cfg(any(windows, test))]
 #[derive(Default)]
 struct RawPointerState {
     last_absolute: Option<(i32, i32)>,
@@ -519,30 +544,39 @@ mod win32 {
     use tokio::sync::mpsc::Sender;
     use windows_sys::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
-        Graphics::Gdi::{
-            EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
-            MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+        Graphics::{
+            Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
+            Gdi::{
+                EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
+                MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+            },
         },
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             Input::{
-                GetRawInputData, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
-                RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE,
-                RIM_TYPEMOUSE, RegisterRawInputDevices,
+                GetRawInputData,
+                KeyboardAndMouse::{
+                    INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+                    SendInput,
+                },
+                MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT, RAWINPUTDEVICE,
+                RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIM_TYPEMOUSE,
+                RegisterRawInputDevices,
             },
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
                 EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, GetDesktopWindow,
                 GetForegroundWindow, GetMessageW, GetShellWindow, GetSystemMetrics, GetWindowRect,
-                HWND_MESSAGE, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
-                MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW,
+                IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MONITORINFOF_PRIMARY,
+                MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW, RegisterClassW,
                 SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SetCursorPos,
                 SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW,
                 WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_DISPLAYCHANGE, WM_INPUT,
                 WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-                WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+                WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT,
+                WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+                WM_XBUTTONUP, WNDCLASSW,
             },
         },
     };
@@ -553,7 +587,8 @@ mod win32 {
         VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
         WindowsDisplay, WindowsInputAdapterError, is_modifier_usage, keyboard_semantic_name,
         normalize_windows_virtual_key, rect_covers_monitor, select_display,
-        update_remote_pressed_keys, virtual_key_to_remote_usage_with_extended,
+        update_locally_visible_modifier, update_remote_pressed_keys,
+        virtual_key_to_remote_usage_with_extended,
     };
 
     const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
@@ -674,6 +709,7 @@ mod win32 {
         pub(super) fn set_suppressed(&mut self, suppressed: bool) {
             let was_suppressed = self.suppressed.swap(suppressed, Ordering::SeqCst);
             let mut restore_point = None;
+            let mut locally_visible_modifiers = Vec::new();
             if let Ok(mut state) = hook_state().lock()
                 && let Some(state) = state.as_mut()
             {
@@ -695,6 +731,9 @@ mod win32 {
                     state.transition_pending = false;
                     state.flush_pending_keyboard_events();
                 } else {
+                    if was_suppressed || state.remote_active || state.transition_pending {
+                        locally_visible_modifiers.extend(state.locally_visible_modifiers.drain());
+                    }
                     if state.remote_active {
                         restore_point = state.active_transition.map(|transition| {
                             state
@@ -720,6 +759,7 @@ mod win32 {
                     SetCursorPos(x, y);
                 }
             }
+            release_locally_visible_modifiers(&locally_visible_modifiers);
         }
 
         pub(super) fn set_edge_switch_enabled(&mut self, enabled: bool) {
@@ -800,6 +840,7 @@ mod win32 {
         suppressed: Arc<AtomicBool>,
         pressed_keys: HashSet<u16>,
         remote_pressed_keys: HashSet<kvmflow_domain::KeyUsage>,
+        locally_visible_modifiers: HashSet<u16>,
         pending_key_events: VecDeque<InputEvent>,
         raw_pointer: RawPointerState,
         raw_input_observed: bool,
@@ -1052,6 +1093,7 @@ mod win32 {
                 suppressed,
                 pressed_keys: HashSet::new(),
                 remote_pressed_keys: HashSet::new(),
+                locally_visible_modifiers: HashSet::new(),
                 pending_key_events: VecDeque::new(),
                 raw_pointer: RawPointerState::default(),
                 raw_input_observed: false,
@@ -1228,7 +1270,7 @@ mod win32 {
                     0,
                     0,
                     0,
-                    HWND_MESSAGE,
+                    ptr::null_mut(),
                     ptr::null_mut(),
                     instance,
                     ptr::null(),
@@ -1295,9 +1337,18 @@ mod win32 {
                 return 0;
             }
             WM_DISPLAYCHANGE => refresh_display_topology(),
+            WM_POWERBROADCAST if wparam as u32 == PBT_APMRESUMEAUTOMATIC => notify_system_resumed(),
             _ => {}
         }
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    fn notify_system_resumed() {
+        if let Ok(guard) = hook_state().lock()
+            && let Some(state) = guard.as_ref()
+        {
+            let _ = state.events.try_send(PlatformEvent::SystemResumed);
+        }
     }
 
     fn process_raw_input(lparam: LPARAM) {
@@ -1482,14 +1533,14 @@ mod win32 {
         if monitor.is_null() {
             return false;
         }
-        let mut window_rect = RECT::default();
+        let Some(window_rect) = visible_window_rect(hwnd) else {
+            return false;
+        };
         let mut monitor_info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        if unsafe { GetWindowRect(hwnd, &mut window_rect) } == 0
-            || unsafe { GetMonitorInfoW(monitor, &mut monitor_info) } == 0
-        {
+        if unsafe { GetMonitorInfoW(monitor, &mut monitor_info) } == 0 {
             return false;
         }
         rect_covers_monitor(
@@ -1506,6 +1557,22 @@ mod win32 {
                 monitor_info.rcMonitor.bottom,
             ),
         )
+    }
+
+    fn visible_window_rect(hwnd: HWND) -> Option<RECT> {
+        let mut rect = RECT::default();
+        let result = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                &mut rect as *mut RECT as *mut core::ffi::c_void,
+                std::mem::size_of::<RECT>() as u32,
+            )
+        };
+        if result >= 0 {
+            return Some(rect);
+        }
+        (unsafe { GetWindowRect(hwnd, &mut rect) } != 0).then_some(rect)
     }
 
     fn clear_hook_state() {
@@ -1538,12 +1605,18 @@ mod win32 {
         };
         let extended = flags & LLKHF_EXTENDED != 0;
         let virtual_key = normalize_windows_virtual_key(virtual_key, scan_code, extended);
+        let suppressed = state.suppressed.load(Ordering::SeqCst);
+        update_locally_visible_modifier(
+            &mut state.locally_visible_modifiers,
+            virtual_key,
+            suppressed || state.transition_pending,
+            down,
+        );
         if down {
             state.pressed_keys.insert(virtual_key);
         } else {
             state.pressed_keys.remove(&virtual_key);
         }
-        let suppressed = state.suppressed.load(Ordering::SeqCst);
         if (suppressed || state.transition_pending) && emergency_hotkey(&state.pressed_keys) {
             let recovery_started_at = Instant::now();
             state.suppressed.store(false, Ordering::SeqCst);
@@ -1568,6 +1641,52 @@ mod win32 {
             );
         }
         suppressed || state.transition_pending
+    }
+
+    fn release_locally_visible_modifiers(virtual_keys: &[u16]) {
+        if virtual_keys.is_empty() {
+            return;
+        }
+        let inputs = virtual_keys
+            .iter()
+            .map(|virtual_key| {
+                let extended = matches!(*virtual_key, VK_RCONTROL | VK_RMENU);
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: *virtual_key,
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP
+                                | if extended { KEYEVENTF_EXTENDEDKEY } else { 0 },
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let sent = unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            )
+        };
+        if sent == inputs.len() as u32 {
+            tracing::info!(
+                component = "input",
+                modifier_count = sent,
+                "Windows local modifier state released"
+            );
+        } else {
+            tracing::warn!(
+                component = "input",
+                expected = inputs.len(),
+                sent,
+                "Windows local modifier state could not be fully released"
+            );
+        }
     }
 
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1963,6 +2082,46 @@ mod tests {
             VK_LMENU
         );
         assert_eq!(normalize_windows_virtual_key(VK_MENU, 0x38, true), VK_RMENU);
+    }
+
+    #[test]
+    fn intercepted_modifier_release_remains_pending_for_local_repair() {
+        let mut visible = std::collections::HashSet::new();
+
+        update_locally_visible_modifier(&mut visible, VK_LCONTROL, false, true);
+        update_locally_visible_modifier(&mut visible, VK_LCONTROL, true, false);
+
+        assert_eq!(visible, std::collections::HashSet::from([VK_LCONTROL]));
+        update_locally_visible_modifier(&mut visible, VK_LCONTROL, false, false);
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn modifiers_pressed_only_during_remote_control_are_not_released_locally() {
+        let mut visible = std::collections::HashSet::new();
+
+        update_locally_visible_modifier(&mut visible, VK_LSHIFT, true, true);
+        update_locally_visible_modifier(&mut visible, VK_LSHIFT, true, false);
+        update_locally_visible_modifier(&mut visible, VK_A, false, true);
+
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn all_windows_modifier_sides_are_tracked_for_local_release() {
+        for virtual_key in [
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_LSHIFT,
+            VK_RSHIFT,
+            VK_LMENU,
+            VK_RMENU,
+            VK_LWIN,
+            VK_RWIN,
+        ] {
+            assert!(is_windows_modifier_virtual_key(virtual_key));
+        }
+        assert!(!is_windows_modifier_virtual_key(VK_A));
     }
 
     #[test]
