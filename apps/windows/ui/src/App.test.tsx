@@ -137,8 +137,20 @@ describe("App", () => {
         return Promise.resolve(cloneSnapshot());
       }
 
+      if (command === "get_discovery") {
+        return Promise.resolve({ available: true, devices: [], error: null });
+      }
+
       if (command === "list_displays") {
         return Promise.resolve(availableDisplays);
+      }
+
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
+      }
+
+      if (command === "set_autostart_enabled") {
+        return Promise.resolve(true);
       }
 
       if (command === "export_foundation_report") {
@@ -166,9 +178,10 @@ describe("App", () => {
 
     await flushPromises();
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(4);
     expect(tauriMocks.invoke).toHaveBeenCalledWith("get_snapshot");
     expect(tauriMocks.invoke).toHaveBeenCalledWith("list_displays");
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("get_autostart_enabled");
   });
 
   it("registers the snapshot listener and unlistens on unmount", async () => {
@@ -176,14 +189,14 @@ describe("App", () => {
 
     await flushPromises();
 
-    expect(tauriMocks.listen).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.listen).toHaveBeenCalledTimes(2);
     expect(tauriMocks.listen).toHaveBeenCalledWith(
       "engine://snapshot",
       expect.any(Function),
     );
     unmount();
 
-    expect(snapshotUnlisten).toHaveBeenCalledTimes(1);
+    expect(snapshotUnlisten).toHaveBeenCalledTimes(2);
   });
 
   it("does not poll after one fake minute", async () => {
@@ -194,7 +207,46 @@ describe("App", () => {
       await vi.advanceTimersByTimeAsync(60_000);
     });
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(4);
+  });
+
+  it("connects to a discovered Mac using its actual port and removes vanished devices", async () => {
+    render(<App />);
+    await flushPromises();
+    act(() => eventHandlers.get("engine://discovery")?.({ payload: {
+      available: true, error: null,
+      devices: [{ deviceId: "device-one", deviceName: "测试 Mac", endpoint: { ip: "192.168.1.8", port: 49999 } }],
+    } }));
+    expect(screen.getByText("192.168.1.8:49999")).toBeVisible();
+    tauriMocks.invoke.mockResolvedValueOnce(undefined);
+    fireEvent.click(screen.getByRole("button", { name: "连接 测试 Mac" }));
+    await flushPromises();
+    expect(tauriMocks.invoke).toHaveBeenLastCalledWith("connect_discovered", { deviceId: "device-one" });
+    act(() => eventHandlers.get("engine://discovery")?.({ payload: { available: true, error: null, devices: [] } }));
+    expect(screen.queryByRole("button", { name: "连接 测试 Mac" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Mac IPv4 地址")).toBeVisible();
+  });
+
+  it("can request an input reset while offline", async () => {
+    render(<App />);
+    await flushPromises();
+    tauriMocks.invoke.mockResolvedValueOnce(undefined);
+    fireEvent.click(screen.getByRole("button", { name: "重置按键状态" }));
+    await flushPromises();
+    expect(tauriMocks.invoke).toHaveBeenLastCalledWith("reset_input");
+  });
+
+  it("enables quiet startup from the Windows preference", async () => {
+    render(<App />);
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /^开机自动启动/ }));
+    await flushPromises();
+
+    expect(tauriMocks.invoke).toHaveBeenLastCalledWith("set_autostart_enabled", {
+      enabled: true,
+    });
+    expect(screen.getByRole("checkbox", { name: /^开机自动启动/ })).toBeChecked();
   });
 
   it("refreshes display topology when the native adapter publishes a system change", async () => {
@@ -209,6 +261,9 @@ describe("App", () => {
       }
       if (command === "list_displays") {
         return Promise.resolve(currentDisplays);
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
       return Promise.reject(new Error(`unexpected command: ${command}`));
     });
@@ -246,6 +301,9 @@ describe("App", () => {
       }
       if (command === "list_displays") {
         return Promise.resolve(availableDisplays);
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
 
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -377,7 +435,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
     await flushPromises();
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(3);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(5);
     expect(tauriMocks.invoke).toHaveBeenLastCalledWith("export_foundation_report");
     expect(
       screen.getByText("C:\\kvmFlow\\diagnostics\\foundation-report.json"),
@@ -391,6 +449,9 @@ describe("App", () => {
       }
       if (command === "list_displays") {
         return Promise.resolve(availableDisplays);
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
       if (command === "enter_control") {
         return Promise.resolve();
@@ -433,6 +494,9 @@ describe("App", () => {
       if (command === "list_displays") {
         return Promise.resolve(availableDisplays);
       }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
+      }
       if (command === "configure_screen_edge") {
         return Promise.resolve();
       }
@@ -472,6 +536,9 @@ describe("App", () => {
       }
       if (command === "list_displays") {
         return Promise.resolve(availableDisplays);
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
       if (command === "configure_target_display") {
         return Promise.resolve();
@@ -540,6 +607,9 @@ describe("App", () => {
       if (command === "list_displays") {
         return Promise.resolve(availableDisplays);
       }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
+      }
       if (
         command === "activate_clipboard_history" ||
         command === "clear_clipboard_history"
@@ -606,7 +676,7 @@ describe("App", () => {
     });
 
     expect(screen.getByRole("alert")).toHaveTextContent("无法加载状态");
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(4);
   });
 
   it("shows a concise Chinese error when the snapshot listener rejects", async () => {
@@ -619,6 +689,9 @@ describe("App", () => {
       }
       if (command === "list_displays") {
         return Promise.resolve(availableDisplays);
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
 
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -661,7 +734,7 @@ describe("App", () => {
     });
 
     expect(screen.getByRole("alert")).toHaveTextContent("收到无效状态数据");
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(4);
   });
 
   it("unlistens when an async listener resolves after unmount", async () => {
@@ -679,6 +752,6 @@ describe("App", () => {
     resolveListener?.(snapshotUnlisten);
     await flushPromises();
 
-    expect(snapshotUnlisten).toHaveBeenCalledTimes(1);
+    expect(snapshotUnlisten).toHaveBeenCalledTimes(2);
   });
 });

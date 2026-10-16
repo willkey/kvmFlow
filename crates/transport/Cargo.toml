@@ -11,6 +11,7 @@ ed25519-dalek.workspace = true
 kvmflow-domain.workspace = true
 kvmflow-protocol.workspace = true
 if-addrs.workspace = true
+mdns-sd.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

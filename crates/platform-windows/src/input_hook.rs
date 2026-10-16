@@ -51,12 +51,40 @@ const VK_LMENU: u16 = 0xa4;
 const VK_RMENU: u16 = 0xa5;
 
 #[cfg(any(windows, test))]
+const WINDOWS_SIDE_MODIFIER_VIRTUAL_KEYS: [u16; 8] = [
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LWIN,
+    VK_RWIN,
+];
+
+#[cfg(any(windows, test))]
 fn rect_covers_monitor(window: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32)) -> bool {
     const TOLERANCE_PX: i32 = 2;
-    window.0 <= monitor.0 + TOLERANCE_PX
-        && window.1 <= monitor.1 + TOLERANCE_PX
-        && window.2 >= monitor.2 - TOLERANCE_PX
-        && window.3 >= monitor.3 - TOLERANCE_PX
+    (i64::from(window.0) - i64::from(monitor.0)).abs() <= i64::from(TOLERANCE_PX)
+        && (i64::from(window.1) - i64::from(monitor.1)).abs() <= i64::from(TOLERANCE_PX)
+        && (i64::from(window.2) - i64::from(monitor.2)).abs() <= i64::from(TOLERANCE_PX)
+        && (i64::from(window.3) - i64::from(monitor.3)).abs() <= i64::from(TOLERANCE_PX)
+}
+
+#[cfg(any(windows, test))]
+fn fullscreen_window_style(style: u32, extended_style: u32, class_name: &str) -> bool {
+    const WINDOWED_STYLE: u32 = 0x00c0_0000 | 0x0004_0000 | 0x4000_0000;
+    const TOOL_WINDOW: u32 = 0x0000_0080;
+    style & WINDOWED_STYLE == 0
+        && extended_style & TOOL_WINDOW == 0
+        && !matches!(
+            class_name,
+            "Shell_TrayWnd"
+                | "Shell_SecondaryTrayWnd"
+                | "XamlExplorerHostIslandWindow"
+                | "Progman"
+                | "WorkerW"
+        )
 }
 
 #[cfg(any(windows, test))]
@@ -118,6 +146,137 @@ fn update_locally_visible_modifier(
         visible.insert(virtual_key);
     } else {
         visible.remove(&virtual_key);
+    }
+}
+
+#[cfg(any(windows, test))]
+fn observe_local_modifier_event(
+    visible: &mut std::collections::HashSet<u16>,
+    pressed: &mut std::collections::HashSet<u16>,
+    virtual_key: u16,
+    down: bool,
+) {
+    if !is_windows_modifier_virtual_key(virtual_key) {
+        return;
+    }
+    update_locally_visible_modifier(visible, virtual_key, false, down);
+    if down {
+        pressed.insert(virtual_key);
+    } else {
+        pressed.remove(&virtual_key);
+    }
+}
+
+#[cfg(any(windows, test))]
+fn seed_locally_visible_modifiers(
+    visible: &mut std::collections::HashSet<u16>,
+    pressed: &mut std::collections::HashSet<u16>,
+    down_virtual_keys: impl IntoIterator<Item = u16>,
+) -> usize {
+    let previous_count = visible.len();
+    for virtual_key in down_virtual_keys {
+        observe_local_modifier_event(visible, pressed, virtual_key, true);
+    }
+    visible.len().saturating_sub(previous_count)
+}
+
+#[cfg(any(windows, test))]
+fn local_modifier_repair_plan(
+    visible: &std::collections::HashSet<u16>,
+    system_down: impl IntoIterator<Item = u16>,
+) -> Vec<u16> {
+    let mut candidates = visible.clone();
+    candidates.extend(system_down);
+    let mut release = candidates.into_iter().collect::<Vec<_>>();
+    release.sort_unstable();
+    release
+}
+
+#[cfg(any(windows, test))]
+fn modifier_release_is_extended(virtual_key: u16) -> bool {
+    matches!(virtual_key, VK_RCONTROL | VK_RMENU | VK_LWIN | VK_RWIN)
+}
+
+#[cfg(any(windows, test))]
+fn modifier_virtual_key_name(virtual_key: u16) -> Option<&'static str> {
+    match virtual_key {
+        VK_LCONTROL => Some("left_control"),
+        VK_RCONTROL => Some("right_control"),
+        VK_LSHIFT => Some("left_shift"),
+        VK_RSHIFT => Some("right_shift"),
+        VK_LMENU => Some("left_alt"),
+        VK_RMENU => Some("right_alt"),
+        VK_LWIN => Some("left_windows"),
+        VK_RWIN => Some("right_windows"),
+        _ => None,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn modifier_virtual_key_names(virtual_keys: impl IntoIterator<Item = u16>) -> Vec<&'static str> {
+    let mut names = virtual_keys
+        .into_iter()
+        .filter_map(modifier_virtual_key_name)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+#[cfg(any(windows, test))]
+const RECENT_KEYBOARD_HOOK_EVENT_LIMIT: usize = 64;
+#[cfg(any(windows, test))]
+const RECENT_KEYBOARD_HOOK_EVENT_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyboardEventSignature {
+    virtual_key: u16,
+    scan_code: u16,
+    extended: bool,
+    down: bool,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct RecentKeyboardHookEvents {
+    events: std::collections::VecDeque<(KeyboardEventSignature, std::time::Instant)>,
+}
+
+#[cfg(any(windows, test))]
+impl RecentKeyboardHookEvents {
+    fn record(&mut self, event: KeyboardEventSignature, now: std::time::Instant) {
+        self.discard_expired(now);
+        if self.events.len() >= RECENT_KEYBOARD_HOOK_EVENT_LIMIT {
+            self.events.pop_front();
+        }
+        self.events.push_back((event, now));
+    }
+
+    fn consume(&mut self, event: KeyboardEventSignature, now: std::time::Instant) -> bool {
+        self.discard_expired(now);
+        let Some(index) = self
+            .events
+            .iter()
+            .position(|(candidate, _)| *candidate == event)
+        else {
+            return false;
+        };
+        self.events.remove(index);
+        true
+    }
+
+    #[cfg(windows)]
+    fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    fn discard_expired(&mut self, now: std::time::Instant) {
+        while self.events.front().is_some_and(|(_, observed_at)| {
+            now.saturating_duration_since(*observed_at) > RECENT_KEYBOARD_HOOK_EVENT_WINDOW
+        }) {
+            self.events.pop_front();
+        }
     }
 }
 
@@ -343,6 +502,16 @@ fn select_display<'a>(
         .or_else(|| displays.first())
 }
 
+#[cfg(any(windows, test))]
+fn reportable_target_display_id<'a>(
+    preferred_id: Option<&str>,
+    selected: &'a WindowsDisplay,
+) -> Option<&'a str> {
+    preferred_id
+        .is_none_or(|preferred_id| preferred_id == selected.target.id)
+        .then_some(selected.target.id.as_str())
+}
+
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy)]
 struct ActiveEdgeTransition {
@@ -483,6 +652,9 @@ pub fn spawn_windows_platform_adapter(
                 PlatformCommand::RestoreLocalPointer { position } => {
                     control.restore_local_pointer(position);
                 }
+                PlatformCommand::ResetInput => {
+                    control.reset_input();
+                }
                 PlatformCommand::ApplyClipboard(payload) => {
                     if let Some(clipboard) = clipboard.as_ref()
                         && let Err(error) = clipboard.apply(payload)
@@ -534,7 +706,7 @@ mod win32 {
         ptr,
         sync::{
             Arc, Mutex, OnceLock,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU8, Ordering},
             mpsc,
         },
         time::{Duration, Instant},
@@ -543,59 +715,90 @@ mod win32 {
     use kvmflow_platform_api::PlatformEvent;
     use tokio::sync::mpsc::Sender;
     use windows_sys::Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
             Gdi::{
-                EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
-                MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+                ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+                MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
             },
         },
-        System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+        Media::{TIMERR_NOERROR, timeBeginPeriod, timeEndPeriod},
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{
+                GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                QueryFullProcessImageNameW,
+            },
+        },
         UI::{
             Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
             Input::{
                 GetRawInputData,
                 KeyboardAndMouse::{
-                    INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-                    SendInput,
+                    GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+                    KEYEVENTF_KEYUP, SendInput,
                 },
                 MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT, RAWINPUTDEVICE,
-                RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIM_TYPEMOUSE,
-                RegisterRawInputDevices,
+                RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIM_TYPEKEYBOARD,
+                RIM_TYPEMOUSE, RegisterRawInputDevices,
             },
             WindowsAndMessaging::{
                 CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-                EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, GetDesktopWindow,
-                GetForegroundWindow, GetMessageW, GetShellWindow, GetSystemMetrics, GetWindowRect,
-                IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MONITORINFOF_PRIMARY,
-                MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW, RegisterClassW,
-                SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SetCursorPos,
-                SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW,
-                WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_DISPLAYCHANGE, WM_INPUT,
-                WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-                WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT,
-                WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
-                WM_XBUTTONUP, WNDCLASSW,
+                EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE, GWL_STYLE,
+                GetClassNameW, GetClientRect, GetDesktopWindow, GetForegroundWindow, GetMessageW,
+                GetShellWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+                GetWindowThreadProcessId, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT,
+                LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, MONITORINFOF_PRIMARY, MSG,
+                MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PostThreadMessageW, RI_KEY_BREAK,
+                RI_KEY_E0, RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+                SM_CYVIRTUALSCREEN, SetCursorPos, SetWindowsHookExW, TranslateMessage,
+                UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL, WH_MOUSE_LL,
+                WINEVENT_OUTOFCONTEXT, WM_DISPLAYCHANGE, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+                WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT, WM_RBUTTONDOWN,
+                WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
             },
         },
     };
 
     use super::{
-        ActiveEdgeTransition, DisplayTarget, EdgeDetector, InputEvent, KeyAction, MouseButton,
-        RawPointerState, RemoteKeyTransition, ScreenBounds, ScreenEdge, VK_CONTROL, VK_F12,
-        VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
-        WindowsDisplay, WindowsInputAdapterError, is_modifier_usage, keyboard_semantic_name,
-        normalize_windows_virtual_key, rect_covers_monitor, select_display,
-        update_locally_visible_modifier, update_remote_pressed_keys,
+        ActiveEdgeTransition, DisplayTarget, EdgeDetector, InputEvent, KeyAction,
+        KeyboardEventSignature, MouseButton, RawPointerState, RecentKeyboardHookEvents,
+        RemoteKeyTransition, ScreenBounds, ScreenEdge, VK_CONTROL, VK_F12, VK_LCONTROL, VK_LMENU,
+        VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+        WINDOWS_SIDE_MODIFIER_VIRTUAL_KEYS, WindowsDisplay, WindowsInputAdapterError,
+        fullscreen_window_style, is_modifier_usage, keyboard_semantic_name,
+        local_modifier_repair_plan, modifier_release_is_extended, modifier_virtual_key_name,
+        modifier_virtual_key_names, normalize_windows_virtual_key, observe_local_modifier_event,
+        rect_covers_monitor, reportable_target_display_id, seed_locally_visible_modifiers,
+        select_display, update_locally_visible_modifier, update_remote_pressed_keys,
         virtual_key_to_remote_usage_with_extended,
     };
 
     const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
     const HID_USAGE_GENERIC_MOUSE: u16 = 0x02;
+    const HID_USAGE_GENERIC_KEYBOARD: u16 = 0x06;
     const EMERGENCY_EDGE_COOLDOWN: Duration = Duration::from_secs(3);
     const PENDING_KEY_EVENT_LIMIT: usize = 64;
+    const REMOTE_INPUT_TIMER_RESOLUTION_MS: u32 = 1;
     const WM_REARM_LOW_LEVEL_HOOKS: u32 = 0x8001;
+    const REARM_REASON_CONTROL_TRANSITION: usize = 0;
+    const REARM_REASON_RAW_KEYBOARD_FALLBACK: usize = 1;
+    const REARM_REASON_MANUAL_RESET: usize = 2;
+    const MODIFIER_REPAIR_INPUT_TAG: usize = 0x4b564d52;
+    // Skip the mutex-heavy mouse path when neither KVM capture nor edge detection needs it.
+    const MOUSE_ACTIVITY_REMOTE_CAPTURE: u8 = 1 << 0;
+    const MOUSE_ACTIVITY_EDGE_DETECTION: u8 = 1 << 1;
+    static MOUSE_ACTIVITY: AtomicU8 = AtomicU8::new(0);
+
+    fn set_mouse_activity(flag: u8, active: bool) {
+        if active {
+            MOUSE_ACTIVITY.fetch_or(flag, Ordering::SeqCst);
+        } else {
+            MOUSE_ACTIVITY.fetch_and(!flag, Ordering::SeqCst);
+        }
+    }
 
     pub(super) fn available_displays() -> Result<Vec<DisplayTarget>, WindowsInputAdapterError> {
         enumerate_displays()
@@ -670,6 +873,7 @@ mod win32 {
         completion: mpsc::Receiver<()>,
         join: Option<std::thread::JoinHandle<()>>,
         suppressed: Arc<AtomicBool>,
+        timer_resolution_active: bool,
     }
 
     impl Win32HookControl {
@@ -678,6 +882,7 @@ mod win32 {
             edge: ScreenEdge,
             target_display_id: Option<String>,
         ) -> Result<Self, WindowsInputAdapterError> {
+            MOUSE_ACTIVITY.store(0, Ordering::SeqCst);
             let (startup_tx, startup_rx) = mpsc::channel();
             let (completion_tx, completion_rx) = mpsc::channel();
             let suppressed = Arc::new(AtomicBool::new(false));
@@ -703,13 +908,20 @@ mod win32 {
                 completion: completion_rx,
                 join: Some(join),
                 suppressed,
+                timer_resolution_active: false,
             })
         }
 
         pub(super) fn set_suppressed(&mut self, suppressed: bool) {
             let was_suppressed = self.suppressed.swap(suppressed, Ordering::SeqCst);
+            if suppressed && !was_suppressed {
+                self.enable_remote_input_timer_resolution();
+            } else if !suppressed && self.timer_resolution_active {
+                self.disable_remote_input_timer_resolution();
+            }
+            set_mouse_activity(MOUSE_ACTIVITY_REMOTE_CAPTURE, suppressed);
             let mut restore_point = None;
-            let mut locally_visible_modifiers = Vec::new();
+            let mut modifiers_to_release = Vec::new();
             if let Ok(mut state) = hook_state().lock()
                 && let Some(state) = state.as_mut()
             {
@@ -721,6 +933,11 @@ mod win32 {
                         component = "input",
                         stage = "windows_capture",
                         capture_source = "low_level_hook",
+                        timer_resolution_ms = if self.timer_resolution_active {
+                            REMOTE_INPUT_TIMER_RESOLUTION_MS
+                        } else {
+                            0
+                        },
                         "Windows remote input capture armed"
                     );
                 } else if !suppressed && state.remote_active {
@@ -732,7 +949,27 @@ mod win32 {
                     state.flush_pending_keyboard_events();
                 } else {
                     if was_suppressed || state.remote_active || state.transition_pending {
-                        locally_visible_modifiers.extend(state.locally_visible_modifiers.drain());
+                        let system_down = current_system_down_modifiers();
+                        modifiers_to_release = local_modifier_repair_plan(
+                            &state.locally_visible_modifiers,
+                            system_down.iter().copied(),
+                        );
+                        tracing::info!(
+                            component = "input",
+                            stage = "windows_modifier_audit",
+                            local_visible = ?modifier_virtual_key_names(
+                                state.locally_visible_modifiers.iter().copied()
+                            ),
+                            hook_pressed = ?modifier_virtual_key_names(
+                                state.pressed_keys.iter().copied()
+                            ),
+                            system_down = ?modifier_virtual_key_names(system_down.iter().copied()),
+                            release = ?modifier_virtual_key_names(
+                                modifiers_to_release.iter().copied()
+                            ),
+                            "Windows modifier state audited before local restore"
+                        );
+                        state.locally_visible_modifiers.clear();
                     }
                     if state.remote_active {
                         restore_point = state.active_transition.map(|transition| {
@@ -751,6 +988,8 @@ mod win32 {
                     state.pressed_keys.clear();
                     state.remote_pressed_keys.clear();
                     state.pending_key_events.clear();
+                    state.recent_keyboard_hook_events.clear();
+                    state.raw_keyboard_fallback_active = false;
                     state.remote_started_at = None;
                 }
             }
@@ -759,13 +998,72 @@ mod win32 {
                     SetCursorPos(x, y);
                 }
             }
-            release_locally_visible_modifiers(&locally_visible_modifiers);
+            release_local_modifiers(&modifiers_to_release, "control_ended");
+        }
+
+        pub(super) fn reset_input(&mut self) {
+            self.set_suppressed(false);
+            if let Ok(mut guard) = hook_state().lock()
+                && let Some(state) = guard.as_mut()
+            {
+                state.held_mouse_buttons.clear();
+                state.raw_observed_modifiers.clear();
+                state.edge_detector.rearm();
+                state.edge_switch_cooldown_until = Some(Instant::now() + EMERGENCY_EDGE_COOLDOWN);
+            }
+            release_local_modifiers(&current_system_down_modifiers(), "manual_input_reset");
+            if unsafe {
+                PostThreadMessageW(
+                    self.thread_id,
+                    WM_REARM_LOW_LEVEL_HOOKS,
+                    REARM_REASON_MANUAL_RESET,
+                    0,
+                )
+            } == 0
+            {
+                tracing::warn!(
+                    component = "input",
+                    "Windows input reset could not request hook reinstallation"
+                );
+            }
+        }
+
+        fn enable_remote_input_timer_resolution(&mut self) {
+            let result = unsafe { timeBeginPeriod(REMOTE_INPUT_TIMER_RESOLUTION_MS) };
+            if result == TIMERR_NOERROR {
+                self.timer_resolution_active = true;
+            } else {
+                tracing::warn!(
+                    component = "input",
+                    stage = "windows_timer_resolution",
+                    result,
+                    "failed to enable high-resolution timer for remote input"
+                );
+            }
+        }
+
+        fn disable_remote_input_timer_resolution(&mut self) {
+            let result = unsafe { timeEndPeriod(REMOTE_INPUT_TIMER_RESOLUTION_MS) };
+            if result == TIMERR_NOERROR {
+                self.timer_resolution_active = false;
+            } else {
+                tracing::warn!(
+                    component = "input",
+                    stage = "windows_timer_resolution",
+                    result,
+                    "failed to disable high-resolution timer for remote input"
+                );
+            }
         }
 
         pub(super) fn set_edge_switch_enabled(&mut self, enabled: bool) {
+            set_mouse_activity(MOUSE_ACTIVITY_EDGE_DETECTION, enabled);
             if let Ok(mut state) = hook_state().lock()
                 && let Some(state) = state.as_mut()
             {
+                if state.edge_detector.enabled == enabled {
+                    return;
+                }
                 state.refresh_target_display();
                 state.edge_detector.set_enabled(enabled);
                 if !enabled && !state.remote_active {
@@ -794,12 +1092,18 @@ mod win32 {
 
         pub(super) fn begin_edge_transition(&mut self, edge: ScreenEdge, position: f32) {
             unsafe {
-                PostThreadMessageW(self.thread_id, WM_REARM_LOW_LEVEL_HOOKS, 0, 0);
+                PostThreadMessageW(
+                    self.thread_id,
+                    WM_REARM_LOW_LEVEL_HOOKS,
+                    REARM_REASON_CONTROL_TRANSITION,
+                    0,
+                );
             }
             if let Ok(mut state) = hook_state().lock()
                 && let Some(state) = state.as_mut()
             {
                 if !state.transition_pending {
+                    state.seed_current_local_modifiers();
                     state.start_keyboard_capture();
                     state.transition_pending = true;
                 }
@@ -841,11 +1145,15 @@ mod win32 {
         pressed_keys: HashSet<u16>,
         remote_pressed_keys: HashSet<kvmflow_domain::KeyUsage>,
         locally_visible_modifiers: HashSet<u16>,
+        raw_observed_modifiers: HashSet<u16>,
         pending_key_events: VecDeque<InputEvent>,
         raw_pointer: RawPointerState,
         raw_input_observed: bool,
         keyboard_hook_observed: bool,
+        recent_keyboard_hook_events: RecentKeyboardHookEvents,
+        raw_keyboard_fallback_active: bool,
         target_display_id: String,
+        active_display_id: String,
         screen_bounds: ScreenBounds,
         edge_detector: EdgeDetector,
         transition_pending: bool,
@@ -856,14 +1164,35 @@ mod win32 {
         stats: CaptureSessionStats,
         remote_started_at: Option<Instant>,
         foreground_fullscreen: bool,
+        last_diagnostic_foreground: usize,
     }
 
     impl HookState {
+        fn seed_current_local_modifiers(&mut self) {
+            let down_virtual_keys = WINDOWS_SIDE_MODIFIER_VIRTUAL_KEYS
+                .into_iter()
+                .filter(|virtual_key| unsafe { GetAsyncKeyState(i32::from(*virtual_key)) } < 0);
+            let seeded = seed_locally_visible_modifiers(
+                &mut self.locally_visible_modifiers,
+                &mut self.pressed_keys,
+                down_virtual_keys,
+            );
+            if seeded > 0 {
+                tracing::info!(
+                    component = "input",
+                    modifier_count = seeded,
+                    "Windows local modifier state seeded before remote control"
+                );
+            }
+        }
+
         fn start_keyboard_capture(&mut self) {
             self.stats = CaptureSessionStats::default();
             self.remote_pressed_keys.clear();
             self.pending_key_events.clear();
             self.keyboard_hook_observed = false;
+            self.recent_keyboard_hook_events.clear();
+            self.raw_keyboard_fallback_active = false;
             self.remote_started_at = Some(Instant::now());
         }
 
@@ -892,6 +1221,7 @@ mod win32 {
                 self.stats.reliable_queue_failures =
                     self.stats.reliable_queue_failures.saturating_add(1);
                 self.suppressed.store(false, Ordering::SeqCst);
+                set_mouse_activity(MOUSE_ACTIVITY_REMOTE_CAPTURE, false);
                 self.transition_pending = false;
                 self.pending_key_events.clear();
                 self.remote_pressed_keys.clear();
@@ -923,7 +1253,8 @@ mod win32 {
                 tracing::warn!(component = "display", "Windows reported no active displays");
                 return;
             };
-            if preferred_id.is_some_and(|preferred| preferred != display.target.id) {
+            let reportable_display_id = reportable_target_display_id(preferred_id, display);
+            if reportable_display_id.is_none() {
                 let fallback_display = &display.target.id;
                 tracing::warn!(
                     component = "display",
@@ -932,14 +1263,25 @@ mod win32 {
                     "requested Windows display is unavailable; using fallback"
                 );
             }
-            self.target_display_id.clone_from(&display.target.id);
-            self.screen_bounds = display.bounds;
             let edge_blocked = display.target.edge_is_occupied(
                 self.edge_detector.edge,
                 displays.iter().map(|display| &display.target),
             );
+            let configured_display_changed = reportable_display_id
+                .is_some_and(|display_id| self.target_display_id != display_id);
+            let topology_changed = self.active_display_id != display.target.id
+                || self.screen_bounds != display.bounds
+                || self.edge_detector.blocked != edge_blocked;
+            if let Some(display_id) = reportable_display_id {
+                self.target_display_id = display_id.to_owned();
+            }
+            self.active_display_id.clone_from(&display.target.id);
+            self.screen_bounds = display.bounds;
             self.edge_detector.set_blocked(edge_blocked);
             self.edge_detector.rearm();
+            if !topology_changed && !configured_display_changed {
+                return;
+            }
             let refreshed_display_id = display.target.id.as_str();
             tracing::info!(
                 component = "display",
@@ -948,9 +1290,11 @@ mod win32 {
                 edge_blocked,
                 "Windows target display refreshed"
             );
-            let _ = self.events.try_send(PlatformEvent::TargetDisplayChanged {
-                display_id: display.target.id.clone(),
-            });
+            if configured_display_changed {
+                let _ = self.events.try_send(PlatformEvent::TargetDisplayChanged {
+                    display_id: display.target.id.clone(),
+                });
+            }
         }
 
         fn refresh_target_display(&mut self) {
@@ -974,6 +1318,8 @@ mod win32 {
         forward_button_events: u64,
         mouse_move_queue_drops: u64,
         reliable_queue_failures: u64,
+        raw_keyboard_fallback_events: u64,
+        keyboard_hook_recovery_requests: u64,
         first_key_latency_ms: Option<u64>,
     }
 
@@ -1021,6 +1367,8 @@ mod win32 {
                 && self.mouse_button_events == 0
                 && self.mouse_move_queue_drops == 0
                 && self.reliable_queue_failures == 0
+                && self.raw_keyboard_fallback_events == 0
+                && self.keyboard_hook_recovery_requests == 0
             {
                 return;
             }
@@ -1041,6 +1389,8 @@ mod win32 {
                 forward_button_events = self.forward_button_events,
                 mouse_move_queue_drops = self.mouse_move_queue_drops,
                 reliable_queue_failures = self.reliable_queue_failures,
+                raw_keyboard_fallback_events = self.raw_keyboard_fallback_events,
+                keyboard_hook_recovery_requests = self.keyboard_hook_recovery_requests,
                 first_key_latency_ms = self.first_key_latency_ms,
                 "Windows input capture session summary"
             );
@@ -1074,6 +1424,19 @@ mod win32 {
             return;
         };
         let selected_display_id = target_display.target.id.clone();
+        let configured_display_id = target_display_id
+            .clone()
+            .unwrap_or_else(|| selected_display_id.clone());
+        let reportable_display_id =
+            reportable_target_display_id(target_display_id.as_deref(), target_display);
+        if reportable_display_id.is_none() {
+            tracing::warn!(
+                component = "display",
+                requested_display = target_display_id.as_deref(),
+                fallback_display = %selected_display_id,
+                "configured Windows display is unavailable at startup; using temporary fallback"
+            );
+        }
         let selected_bounds = target_display.bounds;
         let selected_edge_blocked = target_display
             .target
@@ -1094,11 +1457,15 @@ mod win32 {
                 pressed_keys: HashSet::new(),
                 remote_pressed_keys: HashSet::new(),
                 locally_visible_modifiers: HashSet::new(),
+                raw_observed_modifiers: HashSet::new(),
                 pending_key_events: VecDeque::new(),
                 raw_pointer: RawPointerState::default(),
                 raw_input_observed: false,
                 keyboard_hook_observed: false,
-                target_display_id: selected_display_id.clone(),
+                recent_keyboard_hook_events: RecentKeyboardHookEvents::default(),
+                raw_keyboard_fallback_active: false,
+                target_display_id: configured_display_id,
+                active_display_id: selected_display_id.clone(),
                 screen_bounds: selected_bounds,
                 edge_detector,
                 transition_pending: false,
@@ -1109,14 +1476,17 @@ mod win32 {
                 stats: CaptureSessionStats::default(),
                 remote_started_at: None,
                 foreground_fullscreen: false,
+                last_diagnostic_foreground: 0,
             });
         } else {
             let _ = startup.send(Err(WindowsInputAdapterError::StartFailed));
             return;
         }
-        let _ = events.try_send(PlatformEvent::TargetDisplayChanged {
-            display_id: selected_display_id,
-        });
+        if reportable_display_id.is_some() {
+            let _ = events.try_send(PlatformEvent::TargetDisplayChanged {
+                display_id: selected_display_id,
+            });
+        }
         let raw_input_window = match RawInputWindow::create() {
             Ok(window) => window,
             Err(error) => {
@@ -1170,14 +1540,19 @@ mod win32 {
                 "Windows foreground fullscreen event hook could not be fully installed"
             );
         }
-        refresh_foreground_fullscreen(unsafe { GetForegroundWindow() });
+        let foreground = unsafe { GetForegroundWindow() };
+        refresh_foreground_fullscreen(foreground);
+        log_foreground_modifier_context(foreground);
         tracing::info!(
             component = "input",
             keyboard_capture = "low_level_hook",
+            keyboard_health_fallback = "raw_input_sink",
             mouse_buttons = "low_level_hook",
             mouse_movement = "raw_input_sink",
             "Windows input hooks installed"
         );
+        let startup_modifiers = current_system_down_modifiers();
+        release_local_modifiers(&startup_modifiers, "startup_recovery");
         let _ = startup.send(Ok(thread_id));
         loop {
             let result = unsafe { GetMessageW(&mut message, ptr::null_mut(), 0, 0) };
@@ -1185,6 +1560,11 @@ mod win32 {
                 break;
             }
             if message.message == WM_REARM_LOW_LEVEL_HOOKS {
+                let reason = match message.wParam {
+                    REARM_REASON_RAW_KEYBOARD_FALLBACK => "raw_keyboard_fallback",
+                    REARM_REASON_MANUAL_RESET => "manual_input_reset",
+                    _ => "control_transition",
+                };
                 let replacement_keyboard = unsafe {
                     SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), ptr::null_mut(), 0)
                 };
@@ -1203,8 +1583,14 @@ mod win32 {
                     }
                     tracing::warn!(
                         component = "input",
+                        reason,
                         "Windows input hooks could not be rearmed"
                     );
+                    if let Ok(mut guard) = hook_state().lock()
+                        && let Some(state) = guard.as_mut()
+                    {
+                        state.raw_keyboard_fallback_active = false;
+                    }
                 } else {
                     unsafe {
                         UnhookWindowsHookEx(keyboard);
@@ -1212,11 +1598,13 @@ mod win32 {
                     }
                     keyboard = replacement_keyboard;
                     mouse = replacement_mouse;
-                    tracing::info!(
-                        component = "input",
-                        reason = "control_transition",
-                        "Windows input hooks rearmed"
-                    );
+                    if let Ok(mut guard) = hook_state().lock()
+                        && let Some(state) = guard.as_mut()
+                    {
+                        state.recent_keyboard_hook_events.clear();
+                        state.raw_keyboard_fallback_active = false;
+                    }
+                    tracing::info!(component = "input", reason, "Windows input hooks rearmed");
                 }
                 continue;
             }
@@ -1282,9 +1670,13 @@ mod win32 {
                 }
                 return Err(WindowsInputAdapterError::RawInputWindowFailed);
             }
-            let device = raw_input_mouse_device(RIDEV_INPUTSINK, hwnd);
+            let devices = raw_input_devices(RIDEV_INPUTSINK, hwnd);
             if unsafe {
-                RegisterRawInputDevices(&device, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+                RegisterRawInputDevices(
+                    devices.as_ptr(),
+                    devices.len() as u32,
+                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                )
             } == 0
             {
                 unsafe {
@@ -1299,9 +1691,13 @@ mod win32 {
 
     impl Drop for RawInputWindow {
         fn drop(&mut self) {
-            let device = raw_input_mouse_device(RIDEV_REMOVE, ptr::null_mut());
+            let devices = raw_input_devices(RIDEV_REMOVE, ptr::null_mut());
             unsafe {
-                RegisterRawInputDevices(&device, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+                RegisterRawInputDevices(
+                    devices.as_ptr(),
+                    devices.len() as u32,
+                    std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                );
                 DestroyWindow(self.hwnd);
                 UnregisterClassW(raw_input_window_class().as_ptr(), self.instance);
             }
@@ -1313,13 +1709,21 @@ mod win32 {
         CLASS_NAME.get_or_init(|| "kvmFlowRawInputWindow\0".encode_utf16().collect())
     }
 
-    fn raw_input_mouse_device(flags: u32, hwnd: HWND) -> RAWINPUTDEVICE {
-        RAWINPUTDEVICE {
-            usUsagePage: HID_USAGE_PAGE_GENERIC,
-            usUsage: HID_USAGE_GENERIC_MOUSE,
-            dwFlags: flags,
-            hwndTarget: hwnd,
-        }
+    fn raw_input_devices(flags: u32, hwnd: HWND) -> [RAWINPUTDEVICE; 2] {
+        [
+            RAWINPUTDEVICE {
+                usUsagePage: HID_USAGE_PAGE_GENERIC,
+                usUsage: HID_USAGE_GENERIC_MOUSE,
+                dwFlags: flags,
+                hwndTarget: hwnd,
+            },
+            RAWINPUTDEVICE {
+                usUsagePage: HID_USAGE_PAGE_GENERIC,
+                usUsage: HID_USAGE_GENERIC_KEYBOARD,
+                dwFlags: flags,
+                hwndTarget: hwnd,
+            },
+        ]
     }
 
     unsafe extern "system" fn raw_input_window_proc(
@@ -1369,11 +1773,17 @@ mod win32 {
         if result == u32::MAX || result == 0 {
             return;
         }
-        if input.header.dwType != RIM_TYPEMOUSE {
-            return;
+        match input.header.dwType {
+            RIM_TYPEMOUSE => {
+                let mouse = unsafe { input.data.mouse };
+                process_raw_mouse(mouse.usFlags, mouse.lLastX, mouse.lLastY);
+            }
+            RIM_TYPEKEYBOARD => {
+                let keyboard = unsafe { input.data.keyboard };
+                process_raw_keyboard(keyboard.VKey, keyboard.MakeCode, keyboard.Flags);
+            }
+            _ => {}
         }
-        let mouse = unsafe { input.data.mouse };
-        process_raw_mouse(mouse.usFlags, mouse.lLastX, mouse.lLastY);
     }
 
     fn forward_keyboard_input(
@@ -1382,6 +1792,7 @@ mod win32 {
         extended: bool,
         down: bool,
         pending: bool,
+        capture_source: &'static str,
     ) {
         if !state.keyboard_hook_observed {
             state.keyboard_hook_observed = true;
@@ -1390,7 +1801,7 @@ mod win32 {
                 .map(|started_at| started_at.elapsed().as_millis() as u64);
             tracing::info!(
                 component = "input",
-                capture_source = "low_level_hook",
+                capture_source,
                 "Windows keyboard capture active"
             );
         }
@@ -1439,7 +1850,111 @@ mod win32 {
         }
     }
 
+    fn process_raw_keyboard(virtual_key: u16, scan_code: u16, flags: u16) {
+        if virtual_key == u8::MAX.into() {
+            return;
+        }
+        let extended = u32::from(flags) & RI_KEY_E0 != 0;
+        let virtual_key = normalize_windows_virtual_key(virtual_key, scan_code, extended);
+        let down = u32::from(flags) & RI_KEY_BREAK == 0;
+        let event = KeyboardEventSignature {
+            virtual_key,
+            scan_code,
+            extended,
+            down,
+        };
+        let now = Instant::now();
+        let Ok(mut guard) = hook_state().lock() else {
+            return;
+        };
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let suppressed = state.suppressed.load(Ordering::SeqCst);
+        if let Some(key) = modifier_virtual_key_name(virtual_key) {
+            let changed = if down {
+                state.raw_observed_modifiers.insert(virtual_key)
+            } else {
+                state.raw_observed_modifiers.remove(&virtual_key)
+            };
+            if changed || !down {
+                tracing::info!(
+                    component = "input",
+                    stage = "windows_modifier_audit",
+                    source = "raw_input",
+                    key,
+                    action = if down { "down" } else { "up" },
+                    remote = suppressed,
+                    transition_pending = state.transition_pending,
+                    "Windows modifier input observed"
+                );
+            }
+        }
+        if !suppressed && !state.transition_pending {
+            observe_local_modifier_event(
+                &mut state.locally_visible_modifiers,
+                &mut state.pressed_keys,
+                virtual_key,
+                down,
+            );
+            state.recent_keyboard_hook_events.clear();
+            return;
+        }
+        if state.recent_keyboard_hook_events.consume(event, now) {
+            return;
+        }
+
+        state.stats.raw_keyboard_fallback_events =
+            state.stats.raw_keyboard_fallback_events.saturating_add(1);
+        if !state.raw_keyboard_fallback_active {
+            state.raw_keyboard_fallback_active = true;
+            state.stats.keyboard_hook_recovery_requests = state
+                .stats
+                .keyboard_hook_recovery_requests
+                .saturating_add(1);
+            tracing::warn!(
+                component = "input",
+                stage = "windows_capture",
+                "Windows low-level keyboard hook missed input; raw-input fallback activated"
+            );
+            unsafe {
+                PostThreadMessageW(
+                    GetCurrentThreadId(),
+                    WM_REARM_LOW_LEVEL_HOOKS,
+                    REARM_REASON_RAW_KEYBOARD_FALLBACK,
+                    0,
+                );
+            }
+        }
+
+        update_locally_visible_modifier(
+            &mut state.locally_visible_modifiers,
+            virtual_key,
+            false,
+            down,
+        );
+        if down {
+            state.pressed_keys.insert(virtual_key);
+        } else {
+            state.pressed_keys.remove(&virtual_key);
+        }
+        if emergency_hotkey_active(state) {
+            return;
+        }
+        forward_keyboard_input(
+            state,
+            virtual_key,
+            extended,
+            down,
+            state.transition_pending && !suppressed,
+            "raw_input_fallback",
+        );
+    }
+
     fn process_raw_mouse(flags: u16, x: i32, y: i32) {
+        if MOUSE_ACTIVITY.load(Ordering::Relaxed) & MOUSE_ACTIVITY_REMOTE_CAPTURE == 0 {
+            return;
+        }
         let absolute = flags & MOUSE_MOVE_ABSOLUTE != 0;
         let (x, y) = if absolute {
             raw_absolute_position(flags, x, y)
@@ -1504,7 +2019,81 @@ mod win32 {
         if event == EVENT_OBJECT_LOCATIONCHANGE && object_id != 0 {
             return;
         }
-        refresh_foreground_fullscreen(unsafe { GetForegroundWindow() });
+        let foreground = unsafe { GetForegroundWindow() };
+        refresh_foreground_fullscreen(foreground);
+        if event == EVENT_SYSTEM_FOREGROUND {
+            log_foreground_modifier_context(foreground);
+        }
+    }
+
+    fn log_foreground_modifier_context(hwnd: HWND) {
+        let context = {
+            let Ok(mut guard) = hook_state().lock() else {
+                return;
+            };
+            let Some(state) = guard.as_mut() else {
+                return;
+            };
+            if state.last_diagnostic_foreground == hwnd as usize {
+                return;
+            }
+            state.last_diagnostic_foreground = hwnd as usize;
+            (
+                state.suppressed.load(Ordering::SeqCst),
+                state.transition_pending,
+                state.foreground_fullscreen,
+                modifier_virtual_key_names(state.locally_visible_modifiers.iter().copied()),
+                modifier_virtual_key_names(state.pressed_keys.iter().copied()),
+                modifier_virtual_key_names(state.raw_observed_modifiers.iter().copied()),
+            )
+        };
+        let system_down = current_system_down_modifiers();
+        let mut class_name = [0u16; 256];
+        let class_length =
+            unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) }.max(0)
+                as usize;
+        let mut process_id = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut process_id);
+        }
+        tracing::info!(
+            component = "input",
+            stage = "windows_modifier_audit",
+            process_id,
+            executable = %foreground_executable_name(process_id),
+            window_class = %String::from_utf16_lossy(&class_name[..class_length]),
+            remote = context.0,
+            transition_pending = context.1,
+            fullscreen = context.2,
+            local_visible = ?context.3,
+            hook_pressed = ?context.4,
+            raw_observed = ?context.5,
+            system_down = ?modifier_virtual_key_names(system_down),
+            "Windows foreground input context changed"
+        );
+    }
+
+    fn foreground_executable_name(process_id: u32) -> String {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+        if process.is_null() {
+            return "unavailable".into();
+        }
+        let mut path = vec![0u16; 32768];
+        let mut length = path.len() as u32;
+        let result =
+            unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) };
+        unsafe {
+            CloseHandle(process);
+        }
+        if result == 0 {
+            return "unavailable".into();
+        }
+        // Keep only the executable name, never window titles or user directory paths.
+        let path = String::from_utf16_lossy(&path[..length as usize]);
+        path.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or("unavailable")
+            .to_owned()
     }
 
     fn refresh_foreground_fullscreen(hwnd: HWND) {
@@ -1529,6 +2118,19 @@ mod win32 {
         {
             return false;
         }
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+        let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+        let mut class_name = [0u16; 256];
+        let length =
+            unsafe { GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32) }.max(0)
+                as usize;
+        if !fullscreen_window_style(
+            style,
+            extended_style,
+            &String::from_utf16_lossy(&class_name[..length]),
+        ) {
+            return false;
+        }
         let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
         if monitor.is_null() {
             return false;
@@ -1536,6 +2138,13 @@ mod win32 {
         let Some(window_rect) = visible_window_rect(hwnd) else {
             return false;
         };
+        let mut client_rect = RECT::default();
+        let mut client_origin = POINT::default();
+        if unsafe { GetClientRect(hwnd, &mut client_rect) } == 0
+            || unsafe { ClientToScreen(hwnd, &mut client_origin) } == 0
+        {
+            return false;
+        }
         let mut monitor_info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -1543,6 +2152,12 @@ mod win32 {
         if unsafe { GetMonitorInfoW(monitor, &mut monitor_info) } == 0 {
             return false;
         }
+        let monitor_bounds = (
+            monitor_info.rcMonitor.left,
+            monitor_info.rcMonitor.top,
+            monitor_info.rcMonitor.right,
+            monitor_info.rcMonitor.bottom,
+        );
         rect_covers_monitor(
             (
                 window_rect.left,
@@ -1550,12 +2165,15 @@ mod win32 {
                 window_rect.right,
                 window_rect.bottom,
             ),
+            monitor_bounds,
+        ) && rect_covers_monitor(
             (
-                monitor_info.rcMonitor.left,
-                monitor_info.rcMonitor.top,
-                monitor_info.rcMonitor.right,
-                monitor_info.rcMonitor.bottom,
+                client_origin.x,
+                client_origin.y,
+                client_origin.x + client_rect.right,
+                client_origin.y + client_rect.bottom,
             ),
+            monitor_bounds,
         )
     }
 
@@ -1576,6 +2194,7 @@ mod win32 {
     }
 
     fn clear_hook_state() {
+        MOUSE_ACTIVITY.store(0, Ordering::SeqCst);
         if let Ok(mut state) = hook_state().lock() {
             *state = None;
         }
@@ -1588,7 +2207,13 @@ mod win32 {
             let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let up = matches!(wparam as u32, WM_KEYUP | WM_SYSKEYUP);
             if (down || up)
-                && process_keyboard_hook(virtual_key, data.scanCode as u16, data.flags, down)
+                && process_keyboard_hook(
+                    virtual_key,
+                    data.scanCode as u16,
+                    data.flags,
+                    data.dwExtraInfo,
+                    down,
+                )
             {
                 return 1;
             }
@@ -1596,7 +2221,13 @@ mod win32 {
         unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
     }
 
-    fn process_keyboard_hook(virtual_key: u16, scan_code: u16, flags: u32, down: bool) -> bool {
+    fn process_keyboard_hook(
+        virtual_key: u16,
+        scan_code: u16,
+        flags: u32,
+        extra_info: usize,
+        down: bool,
+    ) -> bool {
         let Ok(mut guard) = hook_state().lock() else {
             return false;
         };
@@ -1606,6 +2237,35 @@ mod win32 {
         let extended = flags & LLKHF_EXTENDED != 0;
         let virtual_key = normalize_windows_virtual_key(virtual_key, scan_code, extended);
         let suppressed = state.suppressed.load(Ordering::SeqCst);
+        if let Some(key) = modifier_virtual_key_name(virtual_key)
+            && (!down || !state.pressed_keys.contains(&virtual_key) || flags & LLKHF_INJECTED != 0)
+        {
+            tracing::info!(
+                component = "input",
+                stage = "windows_modifier_audit",
+                source = "low_level_hook",
+                key,
+                action = if down { "down" } else { "up" },
+                injected = flags & LLKHF_INJECTED != 0,
+                lower_integrity_injected = flags & LLKHF_LOWER_IL_INJECTED != 0,
+                own_repair = extra_info == MODIFIER_REPAIR_INPUT_TAG,
+                intercepted = suppressed || state.transition_pending,
+                remote = suppressed,
+                transition_pending = state.transition_pending,
+                "Windows modifier input observed"
+            );
+        }
+        if suppressed || state.transition_pending {
+            state.recent_keyboard_hook_events.record(
+                KeyboardEventSignature {
+                    virtual_key,
+                    scan_code,
+                    extended,
+                    down,
+                },
+                Instant::now(),
+            );
+        }
         update_locally_visible_modifier(
             &mut state.locally_visible_modifiers,
             virtual_key,
@@ -1617,18 +2277,7 @@ mod win32 {
         } else {
             state.pressed_keys.remove(&virtual_key);
         }
-        if (suppressed || state.transition_pending) && emergency_hotkey(&state.pressed_keys) {
-            let recovery_started_at = Instant::now();
-            state.suppressed.store(false, Ordering::SeqCst);
-            state.stats.log_and_reset("emergency_hotkey");
-            state.pressed_keys.clear();
-            state.remote_pressed_keys.clear();
-            state.pending_key_events.clear();
-            state.transition_pending = false;
-            state.edge_switch_cooldown_until = Some(Instant::now() + EMERGENCY_EDGE_COOLDOWN);
-            let _ = state.events.try_send(PlatformEvent::EmergencyReturn {
-                response_ms: Some(recovery_started_at.elapsed().as_secs_f32() * 1_000.0),
-            });
+        if (suppressed || state.transition_pending) && emergency_hotkey_active(state) {
             return true;
         }
         if suppressed || state.transition_pending {
@@ -1638,19 +2287,48 @@ mod win32 {
                 extended,
                 down,
                 state.transition_pending && !suppressed,
+                "low_level_hook",
             );
         }
         suppressed || state.transition_pending
     }
 
-    fn release_locally_visible_modifiers(virtual_keys: &[u16]) {
+    fn emergency_hotkey_active(state: &mut HookState) -> bool {
+        if !emergency_hotkey(&state.pressed_keys) {
+            return false;
+        }
+        let recovery_started_at = Instant::now();
+        state.suppressed.store(false, Ordering::SeqCst);
+        set_mouse_activity(MOUSE_ACTIVITY_REMOTE_CAPTURE, false);
+        state.stats.log_and_reset("emergency_hotkey");
+        state.pressed_keys.clear();
+        state.remote_pressed_keys.clear();
+        state.pending_key_events.clear();
+        state.recent_keyboard_hook_events.clear();
+        state.raw_keyboard_fallback_active = false;
+        state.transition_pending = false;
+        state.edge_switch_cooldown_until = Some(Instant::now() + EMERGENCY_EDGE_COOLDOWN);
+        let _ = state.events.try_send(PlatformEvent::EmergencyReturn {
+            response_ms: Some(recovery_started_at.elapsed().as_secs_f32() * 1_000.0),
+        });
+        true
+    }
+
+    fn current_system_down_modifiers() -> Vec<u16> {
+        WINDOWS_SIDE_MODIFIER_VIRTUAL_KEYS
+            .into_iter()
+            .filter(|virtual_key| unsafe { GetAsyncKeyState(i32::from(*virtual_key)) } < 0)
+            .collect()
+    }
+
+    fn release_local_modifiers(virtual_keys: &[u16], reason: &'static str) {
         if virtual_keys.is_empty() {
             return;
         }
         let inputs = virtual_keys
             .iter()
             .map(|virtual_key| {
-                let extended = matches!(*virtual_key, VK_RCONTROL | VK_RMENU);
+                let extended = modifier_release_is_extended(*virtual_key);
                 INPUT {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
@@ -1660,7 +2338,7 @@ mod win32 {
                             dwFlags: KEYEVENTF_KEYUP
                                 | if extended { KEYEVENTF_EXTENDEDKEY } else { 0 },
                             time: 0,
-                            dwExtraInfo: 0,
+                            dwExtraInfo: MODIFIER_REPAIR_INPUT_TAG,
                         },
                     },
                 }
@@ -1676,14 +2354,19 @@ mod win32 {
         if sent == inputs.len() as u32 {
             tracing::info!(
                 component = "input",
+                reason,
                 modifier_count = sent,
+                delivery = "queued_not_verified",
+                modifier_keys = ?modifier_virtual_key_names(virtual_keys.iter().copied()),
                 "Windows local modifier state released"
             );
         } else {
             tracing::warn!(
                 component = "input",
+                reason,
                 expected = inputs.len(),
                 sent,
+                modifier_keys = ?modifier_virtual_key_names(virtual_keys.iter().copied()),
                 "Windows local modifier state could not be fully released"
             );
         }
@@ -1700,6 +2383,9 @@ mod win32 {
     }
 
     fn process_mouse(message: u32, data: &MSLLHOOKSTRUCT) -> bool {
+        if message == WM_MOUSEMOVE && MOUSE_ACTIVITY.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
         let Ok(mut guard) = hook_state().lock() else {
             return false;
         };
@@ -1842,6 +2528,7 @@ mod win32 {
                 );
                 state.stats.log_and_reset("reliable_queue_full");
                 state.suppressed.store(false, Ordering::SeqCst);
+                set_mouse_activity(MOUSE_ACTIVITY_REMOTE_CAPTURE, false);
                 let _ = state
                     .events
                     .try_send(PlatformEvent::EmergencyReturn { response_ms: None });
@@ -1887,7 +2574,7 @@ pub enum WindowsInputAdapterError {
     InstallFailed,
     #[error("failed to create the Windows raw-input message window")]
     RawInputWindowFailed,
-    #[error("failed to register the Windows raw-input mouse device")]
+    #[error("failed to register the Windows raw-input devices")]
     RawInputRegistrationFailed,
     #[error("failed to enumerate active Windows displays")]
     DisplayEnumerationFailed,
@@ -2109,19 +2796,70 @@ mod tests {
 
     #[test]
     fn all_windows_modifier_sides_are_tracked_for_local_release() {
-        for virtual_key in [
-            VK_LCONTROL,
-            VK_RCONTROL,
-            VK_LSHIFT,
-            VK_RSHIFT,
-            VK_LMENU,
-            VK_RMENU,
-            VK_LWIN,
-            VK_RWIN,
-        ] {
+        for virtual_key in WINDOWS_SIDE_MODIFIER_VIRTUAL_KEYS {
             assert!(is_windows_modifier_virtual_key(virtual_key));
         }
         assert!(!is_windows_modifier_virtual_key(VK_A));
+    }
+
+    #[test]
+    fn raw_local_modifier_observation_survives_an_intercepted_release() {
+        let mut visible = std::collections::HashSet::new();
+        let mut pressed = std::collections::HashSet::new();
+
+        observe_local_modifier_event(&mut visible, &mut pressed, VK_LMENU, true);
+        update_locally_visible_modifier(&mut visible, VK_LMENU, true, false);
+        pressed.remove(&VK_LMENU);
+
+        assert_eq!(visible, std::collections::HashSet::from([VK_LMENU]));
+        assert!(pressed.is_empty());
+    }
+
+    #[test]
+    fn modifier_snapshot_seeds_only_current_modifier_keys() {
+        let mut visible = std::collections::HashSet::new();
+        let mut pressed = std::collections::HashSet::new();
+
+        let seeded = seed_locally_visible_modifiers(
+            &mut visible,
+            &mut pressed,
+            [VK_RMENU, VK_A, VK_LCONTROL],
+        );
+
+        assert_eq!(seeded, 2);
+        assert_eq!(
+            visible,
+            std::collections::HashSet::from([VK_RMENU, VK_LCONTROL])
+        );
+        assert_eq!(visible, pressed);
+    }
+
+    #[test]
+    fn local_modifier_repair_releases_all_local_candidates() {
+        let visible = std::collections::HashSet::from([VK_LCONTROL, VK_LWIN]);
+
+        let release = local_modifier_repair_plan(&visible, [VK_LWIN, VK_RWIN, VK_LSHIFT]);
+
+        assert_eq!(release, vec![VK_LWIN, VK_RWIN, VK_LSHIFT, VK_LCONTROL]);
+    }
+
+    #[test]
+    fn modifier_virtual_key_names_are_safe_and_stable() {
+        assert_eq!(
+            modifier_virtual_key_names([VK_LWIN, VK_RMENU, VK_LCONTROL]),
+            vec!["left_control", "left_windows", "right_alt"]
+        );
+        assert_eq!(modifier_virtual_key_names([VK_A]), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn windows_modifier_release_flags_cover_extended_keys() {
+        for virtual_key in [VK_RCONTROL, VK_RMENU, VK_LWIN, VK_RWIN] {
+            assert!(modifier_release_is_extended(virtual_key));
+        }
+        for virtual_key in [VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_RSHIFT] {
+            assert!(!modifier_release_is_extended(virtual_key));
+        }
     }
 
     #[test]
@@ -2236,6 +2974,86 @@ mod tests {
 
         assert_eq!(selected.target.id, r"\\.\DISPLAY1");
         assert!(selected.target.primary);
+        assert_eq!(
+            reportable_target_display_id(Some(r"\\.\DISPLAY9"), selected),
+            None
+        );
+    }
+
+    #[test]
+    fn available_preferred_display_can_be_reported_as_the_configured_target() {
+        let displays = vec![display(
+            r"\\.\DISPLAY2",
+            false,
+            ScreenBounds {
+                left: 1920,
+                top: 0,
+                right: 3839,
+                bottom: 1079,
+            },
+        )];
+
+        let selected = select_display(&displays, Some(r"\\.\DISPLAY2")).unwrap();
+
+        assert_eq!(
+            reportable_target_display_id(Some(r"\\.\DISPLAY2"), selected),
+            Some(r"\\.\DISPLAY2")
+        );
+    }
+
+    #[test]
+    fn raw_keyboard_observer_consumes_the_matching_low_level_hook_event() {
+        let now = std::time::Instant::now();
+        let event = KeyboardEventSignature {
+            virtual_key: VK_A,
+            scan_code: 0x1e,
+            extended: false,
+            down: true,
+        };
+        let mut recent = RecentKeyboardHookEvents::default();
+
+        recent.record(event, now);
+
+        assert!(recent.consume(event, now + std::time::Duration::from_millis(5)));
+        assert!(!recent.consume(event, now + std::time::Duration::from_millis(6)));
+    }
+
+    #[test]
+    fn stale_low_level_hook_event_does_not_hide_a_raw_keyboard_fallback() {
+        let now = std::time::Instant::now();
+        let event = KeyboardEventSignature {
+            virtual_key: VK_A,
+            scan_code: 0x1e,
+            extended: false,
+            down: true,
+        };
+        let mut recent = RecentKeyboardHookEvents::default();
+
+        recent.record(event, now);
+
+        assert!(!recent.consume(
+            event,
+            now + RECENT_KEYBOARD_HOOK_EVENT_WINDOW + std::time::Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn recent_low_level_hook_events_remain_bounded() {
+        let now = std::time::Instant::now();
+        let mut recent = RecentKeyboardHookEvents::default();
+        for index in 0..RECENT_KEYBOARD_HOOK_EVENT_LIMIT + 8 {
+            recent.record(
+                KeyboardEventSignature {
+                    virtual_key: VK_A + index as u16,
+                    scan_code: index as u16,
+                    extended: false,
+                    down: true,
+                },
+                now,
+            );
+        }
+
+        assert_eq!(recent.events.len(), RECENT_KEYBOARD_HOOK_EVENT_LIMIT);
     }
 
     #[test]
@@ -2254,6 +3072,16 @@ mod tests {
         assert!(rect_covers_monitor((0, 0, 1920, 1080), monitor));
         assert!(rect_covers_monitor((-1, -1, 1921, 1081), monitor));
         assert!(!rect_covers_monitor((0, 0, 1920, 1040), monitor));
+        assert!(!rect_covers_monitor((0, 0, 3840, 1080), monitor));
+        assert!(!fullscreen_window_style(0x00c0_0000, 0, "SDL_app"));
+        assert!(!fullscreen_window_style(0x0004_0000, 0, "SDL_app"));
+        assert!(!fullscreen_window_style(0, 0x80, "overlay"));
+        assert!(!fullscreen_window_style(
+            0,
+            0,
+            "XamlExplorerHostIslandWindow"
+        ));
+        assert!(fullscreen_window_style(0x8000_0000, 0, "SDL_app"));
     }
 
     #[test]

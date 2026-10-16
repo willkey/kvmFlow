@@ -10,7 +10,7 @@ use kvmflow_domain::{ClipboardFile, ClipboardPayload};
 use kvmflow_protocol::{ClipboardOffer, ClipboardStream, ClipboardStreamKind};
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
 };
 
 use crate::bulk::{BULK_CHUNK_BYTES, BulkMessage};
@@ -137,14 +137,16 @@ impl OutgoingStream {
                 if file.is_none() {
                     *file = Some(File::open(path).await?);
                 }
-                file.as_mut()
-                    .expect("clipboard file opened")
-                    .read_exact(&mut bytes)
-                    .await?;
+                read_file_chunk(file.as_mut().expect("clipboard file opened"), &mut bytes).await?;
             }
         }
         let offset = self.offset;
         self.offset += bytes.len() as u64;
+        if self.offset == self.descriptor.size_bytes
+            && let OutgoingSource::File { file, .. } = &mut self.source
+        {
+            *file = None;
+        }
         Ok(Some(BulkMessage::Chunk {
             transfer_id: transfer_id.to_owned(),
             stream_id: self.descriptor.id,
@@ -154,6 +156,23 @@ impl OutgoingStream {
     }
 }
 
+async fn read_file_chunk(
+    reader: &mut (impl AsyncRead + Unpin),
+    bytes: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    // This future is selected alongside incoming traffic. Commit a short read before
+    // yielding so cancellation cannot advance the file without advancing the offset.
+    let read = reader.read(bytes).await?;
+    if read == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "clipboard source ended before its advertised size",
+        ));
+    }
+    bytes.truncate(read);
+    Ok(())
+}
+
 pub(crate) struct IncomingClipboardTransfer {
     transfer_id: String,
     captured_at_unix_ms: u64,
@@ -161,6 +180,7 @@ pub(crate) struct IncomingClipboardTransfer {
     streams: HashMap<u32, IncomingStream>,
     clipboard_roots: Vec<String>,
     manifest_complete: bool,
+    active_file: Option<(u32, File)>,
 }
 
 impl IncomingClipboardTransfer {
@@ -193,6 +213,7 @@ impl IncomingClipboardTransfer {
             streams: HashMap::new(),
             clipboard_roots: Vec::new(),
             manifest_complete: false,
+            active_file: None,
         };
         incoming.append_offer(offer).await?;
         Ok(incoming)
@@ -232,13 +253,12 @@ impl IncomingClipboardTransfer {
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let file = File::create(&path).await?;
+            drop(File::create(&path).await?);
             self.streams.insert(
                 descriptor.id,
                 IncomingStream {
                     descriptor,
                     path,
-                    file,
                     received: 0,
                 },
             );
@@ -274,8 +294,29 @@ impl IncomingClipboardTransfer {
                 "clipboard chunk offset or size is invalid".into(),
             ));
         }
-        stream.file.write_all(data).await?;
+        if self
+            .active_file
+            .as_ref()
+            .is_none_or(|(id, _)| *id != stream_id)
+        {
+            if let Some((_, mut file)) = self.active_file.take() {
+                file.flush().await?;
+            }
+            self.active_file = Some((
+                stream_id,
+                File::options().append(true).open(&stream.path).await?,
+            ));
+        }
+        let (_, file) = self
+            .active_file
+            .as_mut()
+            .expect("active clipboard file opened");
+        file.write_all(data).await?;
         stream.received += data.len() as u64;
+        if stream.received == stream.descriptor.size_bytes {
+            file.flush().await?;
+            self.active_file = None;
+        }
         Ok(())
     }
 
@@ -308,9 +349,7 @@ impl IncomingClipboardTransfer {
                 })
                 .collect(),
         };
-        for mut stream in self.streams.into_values() {
-            stream.file.flush().await?;
-            drop(stream.file);
+        for stream in self.streams.into_values() {
             match stream.descriptor.kind {
                 ClipboardStreamKind::Text => {
                     payload.text = Some(tokio::fs::read_to_string(stream.path).await?)
@@ -334,7 +373,6 @@ impl IncomingClipboardTransfer {
 struct IncomingStream {
     descriptor: ClipboardStream,
     path: PathBuf,
-    file: File,
     received: u64,
 }
 
@@ -613,6 +651,45 @@ pub(crate) enum ClipboardTransferError {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_short_file_read_is_committed_before_the_worker_selects_another_branch() {
+        let (mut source, mut reader) = tokio::io::duplex(16);
+        source.write_all(b"abc").await.unwrap();
+        let mut bytes = vec![0; 8];
+        tokio::select! {
+            biased;
+            result = read_file_chunk(&mut reader, &mut bytes) => result.unwrap(),
+            _ = std::future::ready(()) => panic!("partial input consumed without committing a chunk"),
+        }
+        assert_eq!(bytes, b"abc");
+        source.write_all(b"defgh").await.unwrap();
+        let mut rest = vec![0; 8];
+        read_file_chunk(&mut reader, &mut rest).await.unwrap();
+        assert_eq!([bytes, rest].concat(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_file_chunk_does_not_lose_bytes() {
+        let (mut source, mut reader) = tokio::io::duplex(16);
+        let mut bytes = vec![0; 4];
+        tokio::select! {
+            biased;
+            _ = read_file_chunk(&mut reader, &mut bytes) => panic!("reader should wait for input"),
+            _ = std::future::ready(()) => {},
+        }
+        source.write_all(b"data").await.unwrap();
+        read_file_chunk(&mut reader, &mut bytes).await.unwrap();
+        assert_eq!(bytes, b"data");
+        drop(source);
+        assert_eq!(
+            read_file_chunk(&mut reader, &mut vec![0; 1])
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
     #[test]
     fn unsafe_relative_paths_are_rejected() {
         assert!(safe_relative_path("../secret").is_err());
@@ -669,6 +746,83 @@ mod tests {
         assert_eq!(completed.text, payload.text);
         assert!(chunk_sizes.len() > 1);
         assert!(chunk_sizes.iter().all(|size| *size <= BULK_CHUNK_BYTES));
+    }
+
+    #[tokio::test]
+    async fn large_directories_transfer_without_accumulating_open_files() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        for index in 0..600 {
+            fs::write(
+                source.path().join(format!("{index}.txt")),
+                if index % 2 == 0 {
+                    b"data".as_slice()
+                } else {
+                    b"".as_slice()
+                },
+            )
+            .unwrap();
+        }
+        let payload = ClipboardPayload {
+            id: "many-files".into(),
+            captured_at_unix_ms: 1,
+            text: None,
+            html: None,
+            rich_text: None,
+            image_png: None,
+            files: vec![ClipboardFile {
+                name: "folder".into(),
+                path: source.path().into(),
+            }],
+        };
+        let mut outgoing = OutgoingClipboardTransfer::prepare(payload).await.unwrap();
+        let mut incoming = None;
+        while let Some(message) = outgoing.next_message().await.unwrap() {
+            match message {
+                BulkMessage::Offer(offer) if offer.reset => {
+                    incoming = Some(
+                        IncomingClipboardTransfer::begin(destination.path(), offer)
+                            .await
+                            .unwrap(),
+                    );
+                }
+                BulkMessage::Offer(offer) => incoming
+                    .as_mut()
+                    .unwrap()
+                    .append_offer(offer)
+                    .await
+                    .unwrap(),
+                BulkMessage::Chunk {
+                    stream_id,
+                    offset,
+                    data,
+                    ..
+                } => {
+                    incoming
+                        .as_mut()
+                        .unwrap()
+                        .write_chunk(stream_id, offset, &data)
+                        .await
+                        .unwrap();
+                }
+                BulkMessage::Complete { .. } => break,
+            }
+            assert!(
+                outgoing
+                    .streams
+                    .iter()
+                    .filter(|s| matches!(&s.source, OutgoingSource::File { file: Some(_), .. }))
+                    .count()
+                    <= 1
+            );
+        }
+        let completed = incoming.unwrap().complete().await.unwrap();
+        for index in 0..600 {
+            assert_eq!(
+                fs::read(completed.files[0].path.join(format!("{index}.txt"))).unwrap(),
+                fs::read(source.path().join(format!("{index}.txt"))).unwrap()
+            );
+        }
     }
 
     #[tokio::test]

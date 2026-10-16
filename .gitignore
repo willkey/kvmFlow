@@ -16,3 +16,5 @@ SHA256SUMS
 .idea/
 .vscode/
 .superpowers/
+.playwright-cli/
+/output/playwright/

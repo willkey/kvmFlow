@@ -11,6 +11,7 @@ pub enum PlatformCommand {
     RestoreLocalPointer { position: f32 },
     Inject(InputEvent),
     ReleaseAll,
+    ResetInput,
     PrepareRemotePointer { edge: ScreenEdge, position: f32 },
     RefreshPermission,
     OpenAccessibilitySettings,

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{ffi::OsStr, path::PathBuf, sync::Mutex};
 
 use kvmflow_diagnostics::{
     ExecutableKind, LoggingGuard, PERSIST_INTERVAL, PreparedStorage, RetentionPolicy,
@@ -23,6 +23,18 @@ mod window;
 
 struct LoggingGuardOwner {
     _guard: Mutex<LoggingGuard>,
+}
+
+const AUTOSTART_ARGUMENT: &str = "--autostart";
+
+fn launched_from_autostart<I, S>(arguments: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    arguments
+        .into_iter()
+        .any(|argument| argument.as_ref() == OsStr::new(AUTOSTART_ARGUMENT))
 }
 
 fn storage_notice(prepared: &PreparedStorage) -> Option<DiagnosticNotice> {
@@ -49,6 +61,17 @@ async fn forward_snapshots(
 }
 
 fn start_snapshot_emitter(app: &tauri::AppHandle, engine: &EngineHandle) {
+    if let Some(mut discovery) = engine.subscribe_discovery() {
+        let discovery_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            while discovery.changed().await.is_ok() {
+                let snapshot = discovery.borrow_and_update().clone();
+                if let Err(error) = discovery_app.emit("engine://discovery", snapshot) {
+                    tracing::warn!(component = "discovery", %error, "failed to emit discovery snapshot");
+                }
+            }
+        });
+    }
     let app = app.clone();
     let engine = engine.clone();
     let snapshots = engine.subscribe();
@@ -141,6 +164,7 @@ fn spawn_production_engine(
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let autostart_launch = launched_from_autostart(std::env::args_os());
     let build = BuildInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         build_id: option_env!("KVMFLOW_BUILD_ID").unwrap_or("dev").into(),
@@ -167,6 +191,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         build_id = %build.build_id,
         storage_root = %prepared.layout.root.display(),
         storage_fallback = prepared.layout.fallback_used,
+        autostart_launch,
         "kvmFlow started"
     );
     let diagnostic_notice = storage_notice(&prepared);
@@ -183,7 +208,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(engine.clone());
     start_snapshot_emitter(app.handle(), &engine);
     tray::create_tray(app.handle(), &engine)?;
-    window::ensure_main_window(app.handle(), &engine)?;
+    if !autostart_launch {
+        window::ensure_main_window(app.handle(), &engine)?;
+    }
 
     Ok(())
 }
@@ -191,8 +218,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         commands::get_snapshot,
+        commands::get_discovery,
+        commands::get_autostart_enabled,
+        commands::set_autostart_enabled,
         commands::export_foundation_report,
         commands::connect_manual,
+        commands::connect_discovered,
         commands::confirm_pairing,
         commands::reject_pairing,
         commands::list_displays,
@@ -200,6 +231,7 @@ fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bu
         commands::configure_screen_edge,
         commands::enter_control,
         commands::return_control,
+        commands::reset_input,
         commands::set_control_enabled,
         commands::set_game_mode_enabled,
         commands::activate_clipboard_history,
@@ -233,9 +265,14 @@ fn show_existing_instance(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
-        |app, _arguments, _working_directory| show_existing_instance(app),
-    ));
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _working_directory| show_existing_instance(app),
+        ))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![AUTOSTART_ARGUMENT]),
+        ));
     let app = configure_builder(builder.setup(setup))
         .build(tauri::generate_context!())
         .expect("failed to build kvmFlow Windows application");
@@ -317,9 +354,15 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use super::{
-        LoggingGuardOwner, forward_snapshots, spawn_startup_engine, storage_notice,
-        test_support::snapshot,
+        LoggingGuardOwner, forward_snapshots, launched_from_autostart, spawn_startup_engine,
+        storage_notice, test_support::snapshot,
     };
+
+    #[test]
+    fn autostart_argument_is_detected_without_hiding_manual_launches() {
+        assert!(launched_from_autostart(["kvmFlow.exe", "--autostart"]));
+        assert!(!launched_from_autostart(["kvmFlow.exe"]));
+    }
 
     fn project_file(path: &str) -> String {
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))

@@ -39,10 +39,13 @@ async fn manual_pairing_reaches_online_and_forwards_input_without_reconnecting()
         spawn_windows_runtime(windows_identity, windows_store.clone(), windows_config);
     windows
         .handle
-        .send(RuntimeCommand::ConfigureEndpoint(NetworkEndpoint {
-            ip: "127.0.0.1".into(),
-            port,
-        }))
+        .send(RuntimeCommand::ConfigureEndpoint {
+            endpoint: NetworkEndpoint {
+                ip: "127.0.0.1".into(),
+                port,
+            },
+            automatic: false,
+        })
         .await
         .expect("configure endpoint");
 

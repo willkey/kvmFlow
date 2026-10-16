@@ -20,6 +20,8 @@ pub struct WindowsRuntimeConfig {
     #[serde(default)]
     pub local_device_id: Option<String>,
     pub endpoint: Option<NetworkEndpoint>,
+    #[serde(default = "enabled_by_default")]
+    pub automatic_discovery: bool,
     pub edge: ScreenEdge,
     #[serde(default)]
     pub target_display_id: Option<String>,
@@ -36,6 +38,7 @@ impl Default for WindowsRuntimeConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             local_device_id: None,
             endpoint: None,
+            automatic_discovery: true,
             edge: ScreenEdge::Bottom,
             target_display_id: None,
             control_enabled: true,
@@ -282,6 +285,7 @@ mod tests {
 
         assert!(config.control_enabled);
         assert!(config.game_mode_enabled);
+        assert!(config.automatic_discovery);
         assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
     }
 

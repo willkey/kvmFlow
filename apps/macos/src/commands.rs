@@ -1,9 +1,66 @@
 use kvmflow_domain::{AppSnapshot, LocalControlPolicy};
 use kvmflow_engine::{EngineCommand, EngineHandle};
+use tauri_plugin_autostart::AutoLaunchManager;
+
+const AUTOSTART_PERMISSION_MESSAGE: &str = "无法写入 Mac 登录项目录 ~/Library/LaunchAgents：该目录应属于当前登录用户。修复目录所有者后重试。";
+
+fn mac_autostart_error(operation: &'static str, error: impl std::fmt::Display) -> String {
+    let detail = error.to_string();
+    tracing::error!(
+        component = "autostart",
+        operation,
+        error = %detail,
+        "Mac autostart operation failed"
+    );
+    if detail.contains("Permission denied") || detail.contains("os error 13") {
+        AUTOSTART_PERMISSION_MESSAGE.into()
+    } else {
+        format!("{operation}开机自动启动失败：{detail}")
+    }
+}
 
 #[tauri::command]
 pub fn get_snapshot(engine: tauri::State<'_, EngineHandle>) -> AppSnapshot {
     engine.current_snapshot()
+}
+
+#[tauri::command]
+pub fn get_autostart_enabled(manager: tauri::State<'_, AutoLaunchManager>) -> Result<bool, String> {
+    manager
+        .is_enabled()
+        .map_err(|error| mac_autostart_error("读取", error))
+}
+
+#[tauri::command]
+pub fn set_autostart_enabled(
+    enabled: bool,
+    manager: tauri::State<'_, AutoLaunchManager>,
+) -> Result<bool, String> {
+    let operation = if enabled { "开启" } else { "关闭" };
+    if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|error| mac_autostart_error(operation, error))?;
+    let actual = manager
+        .is_enabled()
+        .map_err(|error| mac_autostart_error("校验", error))?;
+    if actual != enabled {
+        tracing::error!(
+            component = "autostart",
+            requested = enabled,
+            actual,
+            "Mac autostart preference verification failed"
+        );
+        return Err("系统未能保存开机自启动设置".into());
+    }
+    tracing::info!(
+        component = "autostart",
+        enabled = actual,
+        "Mac autostart preference changed"
+    );
+    Ok(actual)
 }
 
 #[tauri::command]
@@ -83,6 +140,14 @@ pub async fn open_accessibility_settings(
 }
 
 #[tauri::command]
+pub async fn reset_input(engine: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    engine
+        .send(EngineCommand::ResetInput)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn return_control(engine: tauri::State<'_, EngineHandle>) -> Result<(), String> {
     engine
         .send(EngineCommand::ReturnControl)
@@ -95,7 +160,24 @@ mod tests {
     use kvmflow_domain::{AppSnapshot, EndpointRole};
     use tauri::WebviewWindowBuilder;
 
+    use super::{AUTOSTART_PERMISSION_MESSAGE, mac_autostart_error};
     use crate::{configure_builder, test_support::test_engine};
+
+    #[test]
+    fn autostart_permission_error_explains_the_launch_agents_ownership_problem() {
+        assert_eq!(
+            mac_autostart_error("开启", "Permission denied (os error 13)"),
+            AUTOSTART_PERMISSION_MESSAGE
+        );
+    }
+
+    #[test]
+    fn other_autostart_errors_keep_the_operation_and_original_detail() {
+        assert_eq!(
+            mac_autostart_error("关闭", "unexpected failure"),
+            "关闭开机自动启动失败：unexpected failure"
+        );
+    }
 
     #[test]
     fn get_snapshot_is_registered_and_invokes_managed_engine_through_ipc() {

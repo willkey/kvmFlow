@@ -122,6 +122,9 @@ button:focus-visible {
   background: #eaf3fc;
 }
 
+.reset-command { border-color: #d7dde3; color: #3b4e5a; }
+.reset-notice { margin: 0; font-size: 13px; color: #24745b; }
+
 .export-command:disabled {
   cursor: wait;
   opacity: 0.65;
@@ -382,6 +385,32 @@ button:focus-visible {
 .toggle-row input {
   width: 16px;
   height: 16px;
+}
+
+.autostart-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #d8e0e8;
+}
+
+.autostart-toggle span {
+  display: grid;
+  gap: 4px;
+}
+
+.autostart-toggle small {
+  color: #64748b;
+  font-size: 13px;
+}
+
+.autostart-toggle input {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
 }
 
 .local-safety-control {

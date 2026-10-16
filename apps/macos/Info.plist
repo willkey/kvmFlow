@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict/>
+<dict>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>kvmFlow 需要在局域网中向 Windows 控制端发布此 Mac 的连接地址。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_kvmflow._tcp</string>
+    </array>
+</dict>
 </plist>

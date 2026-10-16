@@ -118,6 +118,14 @@ describe("App", () => {
         return Promise.resolve(cloneSnapshot());
       }
 
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
+      }
+
+      if (command === "set_autostart_enabled") {
+        return Promise.resolve(true);
+      }
+
       if (command === "export_foundation_report") {
         return Promise.resolve("/Applications/kvmFlow/diagnostics/foundation-report.json");
       }
@@ -157,8 +165,18 @@ describe("App", () => {
     render(<App />);
     await flushPromises();
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
     expect(tauriMocks.invoke).toHaveBeenCalledWith("get_snapshot");
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("get_autostart_enabled");
+  });
+
+  it("can request an input reset without an active connection", async () => {
+    render(<App />);
+    await flushPromises();
+    tauriMocks.invoke.mockResolvedValueOnce(undefined);
+    fireEvent.click(screen.getByRole("button", { name: "重置按键状态" }));
+    await flushPromises();
+    expect(tauriMocks.invoke).toHaveBeenLastCalledWith("reset_input");
   });
 
   it("registers the snapshot listener and unlistens on unmount", async () => {
@@ -182,7 +200,20 @@ describe("App", () => {
       await vi.advanceTimersByTimeAsync(60_000);
     });
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("enables quiet startup from the Mac preference", async () => {
+    render(<App />);
+    await flushPromises();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /^开机自动启动/ }));
+    await flushPromises();
+
+    expect(tauriMocks.invoke).toHaveBeenLastCalledWith("set_autostart_enabled", {
+      enabled: true,
+    });
+    expect(screen.getByRole("checkbox", { name: /^开机自动启动/ })).toBeChecked();
   });
 
   it("keeps an event snapshot when the pending initial snapshot resolves later", async () => {
@@ -192,6 +223,9 @@ describe("App", () => {
         return new Promise<AppSnapshot>((resolve) => {
           resolveInitialSnapshot = resolve;
         });
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
 
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -259,7 +293,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "导出诊断" }));
     await flushPromises();
 
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(3);
     expect(tauriMocks.invoke).toHaveBeenLastCalledWith("export_foundation_report");
     expect(
       screen.getByText("/Applications/kvmFlow/diagnostics/foundation-report.json"),
@@ -270,6 +304,9 @@ describe("App", () => {
     tauriMocks.invoke.mockImplementation((command: string) => {
       if (command === "get_snapshot") {
         return Promise.resolve(cloneSnapshot());
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
       if (command === "return_control") {
         return Promise.resolve();
@@ -332,7 +369,7 @@ describe("App", () => {
     });
 
     expect(screen.getByRole("alert")).toHaveTextContent("无法加载状态");
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
   });
 
   it("keeps a listener failure visible after the initial snapshot succeeds", async () => {
@@ -342,6 +379,9 @@ describe("App", () => {
         return new Promise<AppSnapshot>((resolve) => {
           resolveInitialSnapshot = resolve;
         });
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
 
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -386,13 +426,16 @@ describe("App", () => {
     });
 
     expect(screen.getByRole("alert")).toHaveTextContent("收到无效状态数据");
-    expect(tauriMocks.invoke).toHaveBeenCalledTimes(1);
+    expect(tauriMocks.invoke).toHaveBeenCalledTimes(2);
   });
 
   it("shows a concise Chinese error when foundation report export rejects", async () => {
     tauriMocks.invoke.mockImplementation((command: string) => {
       if (command === "get_snapshot") {
         return Promise.resolve(cloneSnapshot());
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
 
       return Promise.reject(new Error("export unavailable"));
@@ -411,6 +454,9 @@ describe("App", () => {
     tauriMocks.invoke.mockImplementation((command: string) => {
       if (command === "get_snapshot") {
         return Promise.resolve(cloneSnapshot());
+      }
+      if (command === "get_autostart_enabled") {
+        return Promise.resolve(false);
       }
 
       return Promise.reject(new Error("export unavailable"));
@@ -436,6 +482,9 @@ describe("App", () => {
       tauriMocks.invoke.mockImplementation((command: string) => {
         if (command === "get_snapshot") {
           return Promise.resolve(cloneSnapshot());
+        }
+        if (command === "get_autostart_enabled") {
+          return Promise.resolve(false);
         }
 
         return Promise.reject(new Error("export unavailable"));
@@ -465,6 +514,9 @@ describe("App", () => {
       tauriMocks.invoke.mockImplementation((command: string) => {
         if (command === "get_snapshot") {
           return Promise.resolve(cloneSnapshot());
+        }
+        if (command === "get_autostart_enabled") {
+          return Promise.resolve(false);
         }
 
         exportAttempts += 1;
@@ -498,6 +550,9 @@ describe("App", () => {
       tauriMocks.invoke.mockImplementation((command: string) => {
         if (command === "get_snapshot") {
           return Promise.resolve(cloneSnapshot());
+        }
+        if (command === "get_autostart_enabled") {
+          return Promise.resolve(false);
         }
 
         return Promise.reject(new Error("export unavailable"));

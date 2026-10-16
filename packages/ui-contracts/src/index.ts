@@ -1,4 +1,39 @@
 export type EndpointRole = "windowsController" | "macEndpoint";
+
+export interface DiscoveredDevice {
+  deviceId: string;
+  deviceName: string;
+  endpoint: NetworkEndpoint;
+}
+
+export interface DiscoverySnapshot {
+  available: boolean;
+  devices: DiscoveredDevice[];
+  error: string | null;
+}
+
+export function parseDiscoverySnapshot(value: unknown): DiscoverySnapshot {
+  const snapshot = requireObject(value, "discovery");
+  const devices = requiredField(snapshot, "devices", "discovery");
+  if (!Array.isArray(devices) || devices.length > 64) {
+    throw new TypeError("discovery.devices must be a bounded array");
+  }
+  return {
+    available: parseBoolean(requiredField(snapshot, "available", "discovery"), "discovery.available"),
+    error: parseNullableString(requiredField(snapshot, "error", "discovery"), "discovery.error"),
+    devices: devices.map((value, index) => {
+      const field = `discovery.devices[${index}]`;
+      const device = requireObject(value, field);
+      const endpoint = parseNetworkEndpoint(requiredField(device, "endpoint", field), `${field}.endpoint`);
+      if (!endpoint) throw new TypeError(`${field}.endpoint cannot be null`);
+      return {
+        deviceId: parseString(requiredField(device, "deviceId", field), `${field}.deviceId`),
+        deviceName: parseString(requiredField(device, "deviceName", field), `${field}.deviceName`),
+        endpoint,
+      };
+    }),
+  };
+}
 export type RuntimePhase = "starting" | "running" | "stopping";
 export type WindowState = "open" | "closed";
 export type GateStatus =

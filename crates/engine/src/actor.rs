@@ -40,6 +40,7 @@ pub enum EngineCommand {
         reply: oneshot::Sender<Result<PathBuf, EngineError>>,
     },
     ConfigureEndpoint(NetworkEndpoint),
+    ConfigureDiscoveredEndpoint(NetworkEndpoint),
     ConfigureScreenEdge(ScreenEdge),
     ConfigureTargetDisplay(String),
     ConfigureListenPort(u16),
@@ -50,6 +51,7 @@ pub enum EngineCommand {
         position: f32,
     },
     ReturnControl,
+    ResetInput,
     SetControlEnabled(bool),
     SetGameModeEnabled(bool),
     ActivateClipboardHistory(String),
@@ -69,9 +71,26 @@ pub struct EngineHandle {
     command_tx: mpsc::Sender<EngineCommand>,
     snapshot_rx: watch::Receiver<AppSnapshot>,
     keyboard_rx: watch::Receiver<KeyboardMonitorState>,
+    discovery_rx: Option<watch::Receiver<kvmflow_transport::DiscoverySnapshot>>,
 }
 
 impl EngineHandle {
+    pub fn discovery_snapshot(&self) -> kvmflow_transport::DiscoverySnapshot {
+        self.discovery_rx
+            .as_ref()
+            .map(|receiver| receiver.borrow().clone())
+            .unwrap_or_else(|| kvmflow_transport::DiscoverySnapshot {
+                error: Some("局域网发现服务尚未启动".into()),
+                ..Default::default()
+            })
+    }
+
+    pub fn subscribe_discovery(
+        &self,
+    ) -> Option<watch::Receiver<kvmflow_transport::DiscoverySnapshot>> {
+        self.discovery_rx.clone()
+    }
+
     pub fn current_snapshot(&self) -> AppSnapshot {
         self.snapshot_rx.borrow().clone()
     }
@@ -176,6 +195,9 @@ fn spawn_engine_inner(
         None => (None, None),
     };
 
+    let discovery_rx = runtime_handle
+        .as_ref()
+        .and_then(RuntimeHandle::subscribe_discovery);
     tokio::spawn(run_actor(
         state,
         sampler,
@@ -196,6 +218,7 @@ fn spawn_engine_inner(
         command_tx,
         snapshot_rx,
         keyboard_rx,
+        discovery_rx,
     }
 }
 
@@ -246,6 +269,9 @@ async fn run_actor(
             }
             event = receive_runtime_event(&mut runtime_events) => {
                 if let Some(event) = event {
+                    if matches!(event, RuntimeEvent::InputReceived(_)) && !accepts_remote_input(&state) {
+                        continue;
+                    }
                     update_keyboard_monitor_for_runtime_event(&keyboard_tx, &event);
                     record_runtime_validation(&mut state, &mut monitor, &event);
                     let actions = apply_runtime_event(&mut state, &snapshot_tx, event);
@@ -293,9 +319,12 @@ async fn run_actor(
                     EngineCommand::ConfigureEndpoint(endpoint) => {
                         send_runtime_command(
                             runtime_handle.as_ref(),
-                            RuntimeCommand::ConfigureEndpoint(endpoint),
+                            RuntimeCommand::ConfigureEndpoint { endpoint, automatic: false },
                         )
                         .await;
+                    }
+                    EngineCommand::ConfigureDiscoveredEndpoint(endpoint) => {
+                        send_runtime_command(runtime_handle.as_ref(), RuntimeCommand::ConfigureEndpoint { endpoint, automatic: true }).await;
                     }
                     EngineCommand::ConfigureScreenEdge(edge) => {
                         state.kvm.screen_edge = edge;
@@ -370,6 +399,18 @@ async fn run_actor(
                             RuntimeCommand::EnterControl { edge, position },
                         )
                         .await;
+                    }
+                    EngineCommand::ResetInput => {
+                        keyboard_tx.send_modify(KeyboardMonitorState::clear_pressed);
+                        let actions = reset_input_actions(&mut state);
+                        publish_kvm_status(&mut state, &snapshot_tx);
+                        for command in actions.platform {
+                            send_platform_command(platform_handle.as_ref(), command).await;
+                        }
+                        for command in actions.runtime {
+                            send_runtime_command(runtime_handle.as_ref(), command).await;
+                        }
+                        tracing::info!(component = "input", role = ?state.role, "input state reset requested");
                     }
                     EngineCommand::ReturnControl => {
                         const MANUAL_RETURN_POSITION: f32 = 0.5;
@@ -841,7 +882,7 @@ fn apply_runtime_event(
                 kind = ?payload.kind(),
                 inline_bytes = payload.total_inline_bytes(),
                 file_count = payload.files.len(),
-                "remote clipboard transfer completed"
+                "remote clipboard payload received"
             );
             state.kvm.clipboard.transfer_state = ClipboardTransferState::Idle;
             state.kvm.clipboard.last_error = None;
@@ -1104,6 +1145,9 @@ fn apply_runtime_event(
             }
         }
         RuntimeEvent::EnterControlResult { accepted, reason } => {
+            if state.kvm.control != ControlState::EnteringRemote {
+                return actions;
+            }
             state.kvm.control = if accepted {
                 ControlState::Remote
             } else {
@@ -1163,7 +1207,9 @@ fn apply_runtime_event(
             actions.platform.push(PlatformCommand::ReleaseAll);
         }
         RuntimeEvent::InputReceived(event) => {
-            actions.platform.push(PlatformCommand::Inject(event));
+            if accepts_remote_input(state) {
+                actions.platform.push(PlatformCommand::Inject(event));
+            }
         }
         RuntimeEvent::ReleaseAllRequested => {
             state.kvm.control = ControlState::Local;
@@ -1256,7 +1302,7 @@ fn apply_platform_event(
         PlatformEvent::SystemResumed => {
             tracing::info!(
                 component = "connection",
-                "Windows power event requested immediate KVM recovery"
+                "system power event requested immediate KVM recovery"
             );
             actions
                 .runtime
@@ -1463,6 +1509,27 @@ fn connection_error(
     }
 }
 
+fn accepts_remote_input(state: &RuntimeState) -> bool {
+    state.role == EndpointRole::MacEndpoint
+        && state.kvm.control == ControlState::Remote
+        && state.kvm.local_policy == LocalControlPolicy::Allowed
+        && state.kvm.permission == PermissionStatus::Granted
+}
+
+fn reset_input_actions(state: &mut RuntimeState) -> EngineActions {
+    state.kvm.control = ControlState::Local;
+    let mut actions = EngineActions::default();
+    actions
+        .platform
+        .push(PlatformCommand::SetInputSuppressed(false));
+    actions.platform.push(PlatformCommand::ResetInput);
+    actions.runtime.push(RuntimeCommand::ReleaseAll);
+    actions
+        .runtime
+        .push(RuntimeCommand::ReturnControl { position: 0.5 });
+    actions
+}
+
 fn interval_after(period: Duration) -> tokio::time::Interval {
     let mut interval = tokio::time::interval_at(Instant::now() + period, period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1529,6 +1596,7 @@ mod kvm_tests {
     #[test]
     fn accepted_enter_suppresses_windows_input() {
         let (mut state, snapshots) = state(EndpointRole::WindowsController);
+        state.kvm.control = ControlState::EnteringRemote;
 
         let actions = apply_runtime_event(
             &mut state,
@@ -1997,6 +2065,8 @@ mod kvm_tests {
     #[test]
     fn received_input_is_injected_without_publishing_a_snapshot() {
         let (mut state, snapshots) = state(EndpointRole::MacEndpoint);
+        state.kvm.control = ControlState::Remote;
+        state.kvm.permission = PermissionStatus::Granted;
         let snapshot_updates = snapshots.subscribe();
         let event = InputEvent::MouseMove { dx: 4, dy: -2 };
 
@@ -2011,6 +2081,54 @@ mod kvm_tests {
             PlatformCommand::Inject(received) if received == &event
         )));
         assert!(!snapshot_updates.has_changed().expect("snapshot channel"));
+    }
+
+    #[test]
+    fn input_reset_releases_both_ends_and_rejects_late_input_and_acknowledgements() {
+        for role in [EndpointRole::WindowsController, EndpointRole::MacEndpoint] {
+            let (mut state, snapshots) = state(role);
+            state.kvm.control = ControlState::Remote;
+            state.kvm.permission = PermissionStatus::Granted;
+            let actions = reset_input_actions(&mut state);
+            assert_eq!(state.kvm.control, ControlState::Local);
+            assert!(
+                actions
+                    .platform
+                    .iter()
+                    .any(|c| matches!(c, PlatformCommand::ResetInput))
+            );
+            assert!(
+                actions
+                    .runtime
+                    .iter()
+                    .any(|c| matches!(c, RuntimeCommand::ReleaseAll))
+            );
+            assert!(
+                actions
+                    .runtime
+                    .iter()
+                    .any(|c| matches!(c, RuntimeCommand::ReturnControl { .. }))
+            );
+            let late_input = apply_runtime_event(
+                &mut state,
+                &snapshots,
+                RuntimeEvent::InputReceived(InputEvent::Key {
+                    usage: KeyUsage::LEFT_CONTROL,
+                    action: KeyAction::Down,
+                }),
+            );
+            assert!(late_input.platform.is_empty());
+            let late_ack = apply_runtime_event(
+                &mut state,
+                &snapshots,
+                RuntimeEvent::EnterControlResult {
+                    accepted: true,
+                    reason: None,
+                },
+            );
+            assert!(late_ack.platform.is_empty());
+            assert_eq!(state.kvm.control, ControlState::Local);
+        }
     }
 
     #[test]

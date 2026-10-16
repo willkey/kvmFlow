@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.96"
@@ -30,6 +30,7 @@ kvmflow-domain = { path = "crates/domain" }
 kvmflow-engine = { path = "crates/engine" }
 kvmflow-protocol = { path = "crates/protocol" }
 if-addrs = "0.14"
+mdns-sd = "=0.21.1"
 rand = "0.8"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -39,6 +40,7 @@ sha2 = "0.10"
 sysinfo = "0.39.6"
 tauri = { version = "=2.11.2", features = ["tray-icon"] }
 tauri-build = "=2.6.2"
+tauri-plugin-autostart = "=2.5.1"
 tauri-plugin-single-instance = "=2.4.3"
 tempfile = "3"
 thiserror = "2"

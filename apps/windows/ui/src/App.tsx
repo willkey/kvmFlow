@@ -4,6 +4,7 @@ import { occupiedDisplayEdges } from "@kvmflow/ui-contracts";
 import type {
   AppSnapshot,
   DisplayTarget,
+  DiscoverySnapshot,
   GateStatus,
   MetricProgress,
   ScreenEdge,
@@ -15,13 +16,19 @@ import {
   configureScreenEdge,
   configureTargetDisplay,
   connectManual,
+  connectDiscovered,
   enterControl,
   exportFoundationReport,
+  getAutostartEnabled,
   getInitialSnapshot,
+  getDiscoverySnapshot,
+  listenForDiscovery,
   listenForSnapshots,
   listDisplays,
   rejectPairing,
+  resetInput,
   setControlEnabled,
+  setAutostartEnabled,
   setGameModeEnabled,
 } from "./engineBridge";
 import brandMark from "../../../../assets/brand/kvmflow-mark.svg";
@@ -131,12 +138,16 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [listenerErrorMessage, setListenerErrorMessage] = useState<string | null>(null);
   const [displayErrorMessage, setDisplayErrorMessage] = useState<string | null>(null);
+  const [preferenceErrorMessage, setPreferenceErrorMessage] = useState<string | null>(null);
   const [displays, setDisplays] = useState<DisplayTarget[]>([]);
   const [reportPath, setReportPath] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [ipDraft, setIpDraft] = useState("");
   const [portDraft, setPortDraft] = useState("45888");
   const [isCommandPending, setIsCommandPending] = useState(false);
+  const [resetNotice, setResetNotice] = useState<string | null>(null);
+  const [autostartEnabled, setAutostartEnabledState] = useState<boolean | null>(null);
+  const [discovery, setDiscovery] = useState<DiscoverySnapshot | null>(null);
   const seededConnectionForm = useRef(false);
 
   useEffect(() => {
@@ -189,6 +200,19 @@ export default function App() {
         }
       });
 
+    void getAutostartEnabled()
+      .then((enabled) => {
+        if (isCurrent) {
+          setAutostartEnabledState(enabled);
+          setPreferenceErrorMessage(null);
+        }
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setPreferenceErrorMessage("无法读取开机自启动设置");
+        }
+      });
+
     refreshDisplays();
 
     void listenForSnapshots(
@@ -223,6 +247,27 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let current = true;
+    let receivedUpdate = false;
+    let unlisten: UnlistenFn | undefined;
+    void listenForDiscovery((next) => {
+      receivedUpdate = true;
+      if (current) setDiscovery(next);
+    }).then((release) => {
+      if (current) unlisten = release;
+      else release();
+    }).catch(() => {
+      if (current) setDiscovery({ available: false, devices: [], error: "无法订阅局域网设备更新" });
+    });
+    void getDiscoverySnapshot().then((next) => {
+      if (current && !receivedUpdate) setDiscovery(next);
+    }).catch(() => {
+      if (current && !receivedUpdate) setDiscovery({ available: false, devices: [], error: "无法读取局域网设备，可使用手动 IP 连接" });
+    });
+    return () => { current = false; unlisten?.(); };
+  }, []);
+
   const handleExport = async () => {
     setIsExporting(true);
 
@@ -236,6 +281,7 @@ export default function App() {
   };
 
   const runCommand = async (command: () => Promise<void>) => {
+    setResetNotice(null);
     setIsCommandPending(true);
     try {
       await command();
@@ -270,7 +316,8 @@ export default function App() {
   const resource = snapshot?.latestResource;
   const kvmValidation = snapshot?.validation.kvm;
   const status = snapshot ? windowsStatus(snapshot) : "正在加载";
-  const displayedErrorMessage = displayErrorMessage ?? listenerErrorMessage ?? errorMessage;
+  const displayedErrorMessage =
+    displayErrorMessage ?? preferenceErrorMessage ?? listenerErrorMessage ?? errorMessage;
 
   return (
     <main className="app-shell" aria-labelledby="app-title">
@@ -283,6 +330,14 @@ export default function App() {
           </div>
         </div>
         <div className="header-actions">
+          <button className="export-command reset-command" type="button"
+            title="释放双端按键并返回 Windows"
+            onClick={() => void runCommand(async () => {
+              await resetInput();
+              setResetNotice("重置请求已发送，控制会返回 Windows。");
+            })} disabled={isCommandPending || !snapshot}>
+            重置按键状态
+          </button>
           <span className={`link-badge link-badge--${snapshot?.kvm.link ?? "idle"}`}>
             <i aria-hidden="true" />
             {snapshot?.kvm.link === "online" ? "已连接" : "未连接"}
@@ -322,6 +377,8 @@ export default function App() {
           {reportPath}
         </output>
       ) : null}
+
+      {resetNotice ? <p className="reset-notice" role="status">{resetNotice}</p> : null}
 
       <section className="connection-section" aria-labelledby="connection-heading">
         <div className="section-heading">
@@ -365,6 +422,47 @@ export default function App() {
                 disabled={isCommandPending}
               />
             </label>
+            <label className="control-toggle">
+              <span>
+                <strong>开机自动启动</strong>
+                <small>登录 Windows 后在托盘后台启动，不主动打开主窗口。</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={autostartEnabled ?? false}
+                onChange={(event) => {
+                  const enabled = event.currentTarget.checked;
+                  void runCommand(async () => {
+                    setAutostartEnabledState(await setAutostartEnabled(enabled));
+                    setPreferenceErrorMessage(null);
+                  });
+                }}
+                disabled={isCommandPending || autostartEnabled === null}
+              />
+            </label>
+          </div>
+        ) : null}
+
+        {snapshot && !snapshot.kvm.pairing && snapshot.kvm.link !== "online" ? (
+          <div className="lan-discovery">
+            <h3>局域网设备</h3>
+            {discovery?.devices.length ? (
+              <ul>
+                {discovery.devices.map((device) => (
+                  <li key={device.deviceId}>
+                    <div><strong>{device.deviceName}</strong><code>{device.endpoint.ip}:{device.endpoint.port}</code></div>
+                    <button type="button" aria-label={`连接 ${device.deviceName}`} disabled={isCommandPending || snapshot.kvm.link === "connecting"}
+                      onClick={() => {
+                        setIpDraft(device.endpoint.ip);
+                        setPortDraft(String(device.endpoint.port));
+                        void runCommand(() => connectDiscovered(device.deviceId));
+                      }}>连接</button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p role="status">{discovery?.error ?? (discovery?.available ? "尚未发现可用 Mac" : "正在查找局域网设备")}</p>
+            )}
           </div>
         ) : null}
 

@@ -3,6 +3,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   parseAppSnapshot,
   parseDisplayTargets,
+  parseDiscoverySnapshot,
+  type DiscoverySnapshot,
   type AppSnapshot,
   type DisplayTarget,
   type ScreenEdge,
@@ -10,6 +12,28 @@ import {
 
 export async function getInitialSnapshot(): Promise<AppSnapshot> {
   return parseAppSnapshot(await invoke("get_snapshot"));
+}
+
+export async function getDiscoverySnapshot(): Promise<DiscoverySnapshot> {
+  return parseDiscoverySnapshot(await invoke("get_discovery"));
+}
+
+export async function listenForDiscovery(onSnapshot: (snapshot: DiscoverySnapshot) => void): Promise<UnlistenFn> {
+  return listen<unknown>("engine://discovery", (event) => {
+    try {
+      onSnapshot(parseDiscoverySnapshot(event.payload));
+    } catch {
+      onSnapshot({ available: false, devices: [], error: "收到无效设备发现数据" });
+    }
+  });
+}
+
+export async function getAutostartEnabled(): Promise<boolean> {
+  return invoke<boolean>("get_autostart_enabled");
+}
+
+export async function setAutostartEnabled(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("set_autostart_enabled", { enabled });
 }
 
 export async function listenForSnapshots(
@@ -31,6 +55,10 @@ export async function exportFoundationReport(): Promise<string> {
 
 export async function connectManual(ip: string, port: number): Promise<void> {
   return invoke("connect_manual", { ip, port });
+}
+
+export async function connectDiscovered(deviceId: string): Promise<void> {
+  return invoke("connect_discovered", { deviceId });
 }
 
 export async function confirmPairing(): Promise<void> {
@@ -62,6 +90,10 @@ export async function configureTargetDisplay(displayId: string): Promise<void> {
 
 export async function returnControl(): Promise<void> {
   return invoke("return_control");
+}
+
+export async function resetInput(): Promise<void> {
+  return invoke("reset_input");
 }
 
 export async function setControlEnabled(enabled: boolean): Promise<void> {

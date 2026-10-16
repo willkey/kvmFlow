@@ -9,6 +9,56 @@ use crate::{
 
 const PLATFORM_CHANNEL_CAPACITY: usize = 256;
 
+#[cfg(target_os = "macos")]
+struct MacWakeObserver {
+    center: objc2::rc::Retained<objc2_foundation::NSNotificationCenter>,
+    token:
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacWakeObserver {
+    fn register(events: tokio::sync::mpsc::Sender<PlatformEvent>) -> Self {
+        use std::ptr::NonNull;
+
+        use block2::RcBlock;
+        use objc2_app_kit::{NSWorkspace, NSWorkspaceDidWakeNotification};
+        use objc2_foundation::NSNotification;
+
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        let callback = RcBlock::new(move |_notification: NonNull<NSNotification>| {
+            tracing::info!(component = "connection", "Mac system wake detected");
+            let _ = events.try_send(PlatformEvent::SystemResumed);
+        });
+        // SAFETY: The notification name is a valid AppKit constant, no object filter is used,
+        // and the copied block owns a thread-safe Tokio sender for the observer lifetime.
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceDidWakeNotification),
+                None,
+                None,
+                &callback,
+            )
+        };
+        tracing::info!(
+            component = "connection",
+            "Mac sleep-wake observer initialized"
+        );
+        Self { center, token }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacWakeObserver {
+    fn drop(&mut self) {
+        let token: &objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol> =
+            &self.token;
+        let observer: &objc2::runtime::AnyObject = token.as_ref();
+        // SAFETY: The token was returned by this notification center and remains alive here.
+        unsafe { self.center.removeObserver(observer) };
+    }
+}
+
 pub fn spawn_macos_platform_adapter() -> PlatformBridge {
     let (driver, bridge) = platform_bridge(PLATFORM_CHANNEL_CAPACITY);
     let failure_events = driver.events.clone();
@@ -25,6 +75,8 @@ pub fn spawn_macos_platform_adapter() -> PlatformBridge {
 
 fn run_macos_platform_adapter(mut driver: PlatformDriver) {
     let mut injection = MacInjectionState::default();
+    #[cfg(target_os = "macos")]
+    let _wake_observer = MacWakeObserver::register(driver.events.clone());
     let _ = driver
         .events
         .blocking_send(PlatformEvent::PermissionChanged(accessibility_permission()));
@@ -50,6 +102,14 @@ fn run_macos_platform_adapter(mut driver: PlatformDriver) {
                 }
             }
             PlatformCommand::ReleaseAll => injection.release_all(),
+            PlatformCommand::ResetInput => {
+                let result = injection.release_all();
+                if result.is_ok() {
+                    injection = MacInjectionState::default();
+                    tracing::info!(component = "input", "Mac input state reset completed");
+                }
+                result
+            }
             PlatformCommand::PrepareRemotePointer { edge, position } => {
                 match injection.prepare_remote_pointer(edge, position) {
                     Ok(()) => {
@@ -121,6 +181,22 @@ mod tests {
             .expect("permission event timeout")
             .expect("permission event");
         assert!(matches!(permission, PlatformEvent::PermissionChanged(_)));
+
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_app_kit::{NSWorkspace, NSWorkspaceDidWakeNotification};
+
+            let center = NSWorkspace::sharedWorkspace().notificationCenter();
+            // SAFETY: The test posts the valid AppKit wake notification without an object.
+            unsafe {
+                center.postNotificationName_object(NSWorkspaceDidWakeNotification, None);
+            }
+            let resumed = tokio::time::timeout(Duration::from_secs(1), bridge.events.recv())
+                .await
+                .expect("resume event timeout")
+                .expect("resume event");
+            assert_eq!(resumed, PlatformEvent::SystemResumed);
+        }
 
         bridge
             .handle

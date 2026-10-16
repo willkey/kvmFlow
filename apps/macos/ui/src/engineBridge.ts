@@ -9,6 +9,14 @@ export async function getInitialSnapshot(): Promise<AppSnapshot> {
   return parseAppSnapshot(await invoke("get_snapshot"));
 }
 
+export async function getAutostartEnabled(): Promise<boolean> {
+  return invoke<boolean>("get_autostart_enabled");
+}
+
+export async function setAutostartEnabled(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("set_autostart_enabled", { enabled });
+}
+
 export async function listenForSnapshots(
   onSnapshot: (snapshot: AppSnapshot) => void,
   onMalformedSnapshot?: () => void,
@@ -52,4 +60,8 @@ export async function openAccessibilitySettings(): Promise<void> {
 
 export async function returnControl(): Promise<void> {
   return invoke("return_control");
+}
+
+export async function resetInput(): Promise<void> {
+  return invoke("reset_input");
 }

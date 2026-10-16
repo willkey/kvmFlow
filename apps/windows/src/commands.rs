@@ -1,14 +1,50 @@
 use kvmflow_domain::{AppSnapshot, DisplayTarget, NetworkEndpoint, ScreenEdge};
 use kvmflow_engine::{EngineCommand, EngineHandle};
 use kvmflow_platform_windows::available_windows_displays;
+use tauri_plugin_autostart::AutoLaunchManager;
 
 fn snapshot_payload(engine: &EngineHandle) -> AppSnapshot {
     engine.current_snapshot()
 }
 
 #[tauri::command]
+pub fn get_discovery(
+    engine: tauri::State<'_, EngineHandle>,
+) -> kvmflow_transport::DiscoverySnapshot {
+    engine.discovery_snapshot()
+}
+
+#[tauri::command]
 pub fn get_snapshot(engine: tauri::State<'_, EngineHandle>) -> AppSnapshot {
     snapshot_payload(&engine)
+}
+
+#[tauri::command]
+pub fn get_autostart_enabled(manager: tauri::State<'_, AutoLaunchManager>) -> Result<bool, String> {
+    manager.is_enabled().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn set_autostart_enabled(
+    enabled: bool,
+    manager: tauri::State<'_, AutoLaunchManager>,
+) -> Result<bool, String> {
+    if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|error| error.to_string())?;
+    let actual = manager.is_enabled().map_err(|error| error.to_string())?;
+    if actual != enabled {
+        return Err("系统未能保存开机自启动设置".into());
+    }
+    tracing::info!(
+        component = "autostart",
+        enabled = actual,
+        "Windows autostart preference changed"
+    );
+    Ok(actual)
 }
 
 #[tauri::command]
@@ -19,6 +55,25 @@ pub async fn export_foundation_report(
         .export_report()
         .await
         .map(|path| path.display().to_string())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn connect_discovered(
+    device_id: String,
+    engine: tauri::State<'_, EngineHandle>,
+) -> Result<(), String> {
+    let discovery = engine.discovery_snapshot();
+    let device = discovery
+        .devices
+        .into_iter()
+        .find(|device| device.device_id == device_id)
+        .filter(|_| discovery.available)
+        .ok_or("设备已离线，请等待重新发现或手动连接")?;
+    device.endpoint.validate().map_err(str::to_owned)?;
+    engine
+        .send(EngineCommand::ConfigureDiscoveredEndpoint(device.endpoint))
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -91,6 +146,14 @@ pub async fn configure_target_display(
     }
     engine
         .send(EngineCommand::ConfigureTargetDisplay(display_id))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn reset_input(engine: tauri::State<'_, EngineHandle>) -> Result<(), String> {
+    engine
+        .send(EngineCommand::ResetInput)
         .await
         .map_err(|error| error.to_string())
 }

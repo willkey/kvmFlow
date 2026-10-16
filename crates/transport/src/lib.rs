@@ -5,6 +5,7 @@
 mod bulk;
 mod channel;
 mod config;
+mod discovery;
 mod identity;
 mod identity_store;
 mod runtime;
@@ -14,6 +15,7 @@ pub use channel::{ChannelParts, ChannelTrust, SecureChannel, SecureReadHalf, Sec
 pub use config::{
     ConfigError, ConfigStore, DEFAULT_MAC_LISTEN_PORT, MacRuntimeConfig, WindowsRuntimeConfig,
 };
+pub use discovery::{DiscoveredDevice, DiscoverySnapshot};
 pub use identity::{DeviceIdentity, IdentityError, TrustedPeer};
 pub use identity_store::{IDENTITY_FILE_NAME, IdentityStoreError, load_or_create_identity};
 pub use runtime::{

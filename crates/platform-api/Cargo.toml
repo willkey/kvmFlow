@@ -11,3 +11,7 @@ clipboard-rs.workspace = true
 kvmflow-domain = { path = "../domain" }
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win = "5.4.1"

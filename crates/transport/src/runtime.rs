@@ -13,7 +13,7 @@ use kvmflow_domain::{
 };
 use kvmflow_protocol::{ChannelPurpose, ProtocolMessage};
 use tokio::{
-    sync::{Notify, mpsc},
+    sync::{Notify, mpsc, watch},
     time::{Instant, MissedTickBehavior},
 };
 
@@ -24,6 +24,7 @@ use crate::{
     clipboard_history::{ClipboardHistoryStore, activated_payload_id},
     clipboard_transfer::{IncomingClipboardTransfer, OutgoingClipboardTransfer},
     connect,
+    discovery::{DiscoverySnapshot, LanService},
 };
 
 const RUNTIME_COMMAND_CAPACITY: usize = 128;
@@ -45,7 +46,10 @@ pub enum RecoveryTrigger {
 
 #[derive(Debug)]
 pub enum RuntimeCommand {
-    ConfigureEndpoint(NetworkEndpoint),
+    ConfigureEndpoint {
+        endpoint: NetworkEndpoint,
+        automatic: bool,
+    },
     ConfigureScreenEdge(ScreenEdge),
     ConfigureTargetDisplay(String),
     ConfigureListenPort(u16),
@@ -171,6 +175,7 @@ pub struct RuntimeHandle {
     command_tx: mpsc::Sender<RuntimeCommand>,
     mouse_movement: Option<MouseMovementSender>,
     clipboard: ClipboardMailbox,
+    discovery: Option<watch::Receiver<DiscoverySnapshot>>,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -182,6 +187,10 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    pub fn subscribe_discovery(&self) -> Option<watch::Receiver<DiscoverySnapshot>> {
+        self.discovery.clone()
+    }
+
     pub async fn send(&self, command: RuntimeCommand) -> Result<(), RuntimeSendError> {
         let command = match command {
             RuntimeCommand::SetClipboard(payload) => {
@@ -229,6 +238,7 @@ pub fn spawn_windows_runtime(
     let (event_tx, event_rx) = mpsc::channel(RUNTIME_EVENT_CAPACITY);
     let (mouse_movement_tx, mouse_movement_rx) = mouse_movement_channel();
     let clipboard = ClipboardMailbox::default();
+    let (discovery_tx, discovery_rx) = watch::channel(DiscoverySnapshot::default());
     spawn_network_change_watcher(command_tx.clone());
     tokio::spawn(run_windows_runtime(
         identity,
@@ -238,12 +248,14 @@ pub fn spawn_windows_runtime(
         mouse_movement_rx,
         clipboard.clone(),
         event_tx,
+        discovery_tx,
     ));
     RuntimeBridge {
         handle: RuntimeHandle {
             command_tx,
             mouse_movement: Some(mouse_movement_tx),
             clipboard,
+            discovery: Some(discovery_rx),
         },
         events: event_rx,
     }
@@ -271,6 +283,7 @@ pub fn spawn_macos_runtime(
             command_tx,
             mouse_movement: None,
             clipboard,
+            discovery: None,
         },
         events: event_rx,
     }
@@ -314,6 +327,7 @@ struct ClipboardSession {
 }
 
 struct WindowsRuntimeServices<'a> {
+    discovery: Option<&'a watch::Receiver<DiscoverySnapshot>>,
     store: &'a ConfigStore,
     clipboard: &'a ClipboardMailbox,
     history: &'a ClipboardHistoryStore,
@@ -640,7 +654,7 @@ async fn run_clipboard_worker(
 fn clears_pending_mouse_movement(command: &RuntimeCommand) -> bool {
     matches!(
         command,
-        RuntimeCommand::ConfigureEndpoint(_)
+        RuntimeCommand::ConfigureEndpoint { .. }
             | RuntimeCommand::EnterControl { .. }
             | RuntimeCommand::ReturnControl { .. }
             | RuntimeCommand::ReleaseAll
@@ -840,6 +854,7 @@ fn mouse_movement_channel() -> (MouseMovementSender, MouseMovementReceiver) {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_windows_runtime(
     identity: DeviceIdentity,
     store: ConfigStore,
@@ -848,7 +863,20 @@ async fn run_windows_runtime(
     mut mouse_movement: MouseMovementReceiver,
     clipboard: ClipboardMailbox,
     events: mpsc::Sender<RuntimeEvent>,
+    discovery_tx: watch::Sender<DiscoverySnapshot>,
 ) {
+    let discovery_rx = discovery_tx.subscribe();
+    let _discovery = match LanService::browse(discovery_tx.clone()) {
+        Ok(service) => Some(service),
+        Err(error) => {
+            tracing::warn!(component = "discovery", %error, "Windows LAN discovery unavailable");
+            discovery_tx.send_replace(DiscoverySnapshot {
+                error: Some(format!("局域网发现不可用：{error}，可使用手动 IP 连接")),
+                ..Default::default()
+            });
+            None
+        }
+    };
     let mut attempt_id = 0_u64;
     let mut failure_count = 0_u32;
     let history = ClipboardHistoryStore::new(store.data_dir());
@@ -856,6 +884,7 @@ async fn run_windows_runtime(
         emit_clipboard_history_error(&events, error).await;
     }
     let services = WindowsRuntimeServices {
+        discovery: Some(&discovery_rx),
         store: &store,
         clipboard: &clipboard,
         history: &history,
@@ -890,8 +919,18 @@ async fn run_windows_runtime(
     publish_clipboard_history(&history, &events).await;
 
     loop {
-        let Some(endpoint) = wait_for_windows_endpoint(&mut config, &mut commands, &services).await
-        else {
+        let discovered_endpoint = if config.automatic_discovery && config.endpoint.is_some() {
+            discovery_rx
+                .borrow()
+                .trusted_endpoint(config.trusted_peer.as_ref())
+        } else {
+            None
+        };
+        let endpoint = match discovered_endpoint {
+            Some(endpoint) => Some(endpoint),
+            None => wait_for_windows_endpoint(&mut config, &mut commands, &services).await,
+        };
+        let Some(endpoint) = endpoint else {
             return;
         };
         attempt_id = attempt_id.saturating_add(1);
@@ -917,23 +956,39 @@ async fn run_windows_runtime(
                     },
                 )
                 .await;
-                if !windows_backoff(&mut config, &mut commands, &services).await {
+                if !windows_backoff(&mut config, &mut commands, &services, Some(&endpoint)).await {
                     return;
                 }
                 continue;
             }
         };
+        let trusted_peer = config.trusted_peer.clone();
         let connection = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            connect(address, &identity, config.trusted_peer.as_ref()),
-        )
-        .await;
+            connect(address, &identity, trusted_peer.as_ref()),
+        );
+        tokio::pin!(connection);
+        let mut discovery = services.discovery.cloned();
+        let connection = loop {
+            tokio::select! {
+                result = &mut connection => break Some(result),
+                snapshot = discovery_update(&mut discovery) => {
+                    if replacement_endpoint(&config, &snapshot, Some(&endpoint)).is_some() {
+                        tracing::info!(component = "discovery", old_ip = %endpoint.ip, "cancel stale connection after paired Mac address changed");
+                        break None;
+                    }
+                }
+            }
+        };
+        let Some(connection) = connection else {
+            continue;
+        };
         let channel = match connection {
             Ok(Ok(channel)) => channel,
             Ok(Err(error)) => {
                 failure_count = failure_count.saturating_add(1);
                 emit_connection_failure(&events, attempt_id, failure_count, error).await;
-                if !windows_backoff(&mut config, &mut commands, &services).await {
+                if !windows_backoff(&mut config, &mut commands, &services, Some(&endpoint)).await {
                     return;
                 }
                 continue;
@@ -949,13 +1004,22 @@ async fn run_windows_runtime(
                     },
                 )
                 .await;
-                if !windows_backoff(&mut config, &mut commands, &services).await {
+                if !windows_backoff(&mut config, &mut commands, &services, Some(&endpoint)).await {
                     return;
                 }
                 continue;
             }
         };
         failure_count = 0;
+        if matches!(channel.trust(), ChannelTrust::Authenticated)
+            && config.endpoint.as_ref() != Some(&endpoint)
+        {
+            config.endpoint = Some(endpoint.clone());
+            tracing::info!(component = "discovery", ip = %endpoint.ip, port = endpoint.port, "authenticated and saved the paired Mac's discovered address");
+            if let Err(error) = store.save_windows(&config) {
+                emit_runtime_failed(&events, error).await;
+            }
+        }
 
         let outcome = prepare_windows_channel(
             channel,
@@ -981,7 +1045,7 @@ async fn run_windows_runtime(
                     },
                 )
                 .await;
-                if !windows_backoff(&mut config, &mut commands, &services).await {
+                if !windows_backoff(&mut config, &mut commands, &services, Some(&endpoint)).await {
                     return;
                 }
             }
@@ -1016,13 +1080,17 @@ async fn wait_for_windows_endpoint(
         clipboard,
         history,
         events,
+        ..
     } = services;
     if let Some(endpoint) = config.endpoint.clone() {
         return Some(endpoint);
     }
     loop {
         match commands.recv().await? {
-            RuntimeCommand::ConfigureEndpoint(endpoint) => {
+            RuntimeCommand::ConfigureEndpoint {
+                endpoint,
+                automatic,
+            } => {
                 if let Err(message) = endpoint.validate() {
                     emit(
                         events,
@@ -1034,6 +1102,7 @@ async fn wait_for_windows_endpoint(
                     continue;
                 }
                 config.endpoint = Some(endpoint.clone());
+                config.automatic_discovery = automatic;
                 if let Err(error) = store.save_windows(config) {
                     emit_runtime_failed(events, error).await;
                     continue;
@@ -1071,27 +1140,104 @@ async fn wait_for_windows_endpoint(
     }
 }
 
+fn replacement_endpoint(
+    config: &WindowsRuntimeConfig,
+    snapshot: &DiscoverySnapshot,
+    current: Option<&NetworkEndpoint>,
+) -> Option<NetworkEndpoint> {
+    if !config.automatic_discovery || config.endpoint.is_none() {
+        return None;
+    }
+    snapshot
+        .trusted_endpoint(config.trusted_peer.as_ref())
+        .filter(|endpoint| endpoint.validate().is_ok() && Some(endpoint) != current)
+}
+
+struct HeartbeatHealth {
+    last_ack: Instant,
+    probe: Option<(Instant, u64)>,
+}
+
+impl HeartbeatHealth {
+    fn new() -> Self {
+        Self {
+            last_ack: Instant::now(),
+            probe: None,
+        }
+    }
+
+    fn acknowledge(&mut self, id: u64) -> bool {
+        if self.probe.is_some_and(|(_, expected)| expected != id) {
+            return false;
+        }
+        let recovered = self.probe.take().is_some();
+        self.last_ack = Instant::now();
+        recovered
+    }
+
+    fn expired(&self) -> bool {
+        self.probe
+            .is_some_and(|(started, _)| started.elapsed() >= HEARTBEAT_INTERVAL)
+    }
+
+    fn request_confirmation(&mut self, id: u64) -> bool {
+        if self.last_ack.elapsed() < HEARTBEAT_TIMEOUT || self.probe.is_some() {
+            return false;
+        }
+        self.probe = Some((Instant::now(), id));
+        true
+    }
+}
+
+async fn discovery_update(
+    receiver: &mut Option<watch::Receiver<DiscoverySnapshot>>,
+) -> DiscoverySnapshot {
+    if let Some(rx) = receiver {
+        if rx.changed().await.is_ok() {
+            return rx.borrow_and_update().clone();
+        }
+        *receiver = None;
+    }
+    std::future::pending().await
+}
+
 async fn windows_backoff(
     config: &mut WindowsRuntimeConfig,
     commands: &mut mpsc::Receiver<RuntimeCommand>,
     services: &WindowsRuntimeServices<'_>,
+    attempted_endpoint: Option<&NetworkEndpoint>,
 ) -> bool {
     let WindowsRuntimeServices {
         store,
         clipboard,
         history,
         events,
+        ..
     } = services;
+    let mut discovery = services.discovery.cloned();
+    if discovery
+        .as_ref()
+        .is_some_and(|rx| replacement_endpoint(config, &rx.borrow(), attempted_endpoint).is_some())
+    {
+        return true;
+    }
     let delay = tokio::time::sleep(RECONNECT_INTERVAL);
     tokio::pin!(delay);
     loop {
         tokio::select! {
+            snapshot = discovery_update(&mut discovery) => {
+                if replacement_endpoint(config, &snapshot, attempted_endpoint).is_some() {
+                    tracing::info!(component = "discovery", "paired Mac address changed; skip reconnect delay");
+                    return true;
+                }
+            }
             _ = &mut delay => return true,
             command = commands.recv() => {
                 match command {
-                    Some(RuntimeCommand::ConfigureEndpoint(endpoint)) => {
+                    Some(RuntimeCommand::ConfigureEndpoint { endpoint, automatic }) => {
                         if endpoint.validate().is_ok() {
                             config.endpoint = Some(endpoint);
+                            config.automatic_discovery = automatic;
                             if let Err(error) = store.save_windows(config) {
                                 emit_runtime_failed(events, error).await;
                             } else {
@@ -1373,7 +1519,9 @@ async fn run_windows_session(
         clipboard,
         history,
         events,
+        ..
     } = services;
+    let mut discovery = services.discovery.cloned();
     mouse_movement.clear();
     let (clipboard_updates, clipboard_update_rx) = mpsc::channel(8);
     let clipboard_worker = run_clipboard_worker(
@@ -1389,12 +1537,76 @@ async fn run_windows_session(
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     heartbeat.tick().await;
-    let mut last_ack = Instant::now();
+    let mut heartbeat_health = HeartbeatHealth::new();
     let mut control_requested_at = None;
 
     loop {
         tokio::select! {
             biased;
+            message = channel.receive() => {
+                match message {
+                    Ok(ProtocolMessage::HeartbeatAck { sent_at_unix_ms }) => {
+                        let ack_age_ms = heartbeat_health.last_ack.elapsed().as_millis() as u64;
+                        if heartbeat_health.acknowledge(sent_at_unix_ms) {
+                            tracing::info!(component = "heartbeat", ack_age_ms, "heartbeat confirmation recovered delayed session");
+                        }
+                        let latency = unix_time_ms().saturating_sub(sent_at_unix_ms) as f32;
+                        emit(events, RuntimeEvent::LatencyUpdated { milliseconds: latency }).await;
+                    }
+                    Ok(ProtocolMessage::EnterControlAck { accepted, reason }) => {
+                        if control_requested_at.take().is_some() {
+                            emit(events, RuntimeEvent::EnterControlResult { accepted, reason }).await;
+                        }
+                    }
+                    Ok(ProtocolMessage::ReturnControl { position }) => {
+                        control_requested_at = None;
+                        let _ = channel.send(ProtocolMessage::ReturnControlAck).await;
+                        emit(events, RuntimeEvent::ReturnControlRequested { position }).await;
+                    }
+                    Ok(ProtocolMessage::ReturnControlAck) => {
+                        emit(events, RuntimeEvent::ReturnControlAcknowledged).await;
+                    }
+                    Ok(ProtocolMessage::RemotePause { paused }) => {
+                        emit(events, RuntimeEvent::RemotePauseChanged { paused }).await;
+                    }
+                    Ok(ProtocolMessage::ReleaseAll) => {
+                        emit(events, RuntimeEvent::ReleaseAllRequested).await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => return ChannelOutcome::Reconnect(error.to_string()),
+                }
+            }
+            _ = heartbeat.tick() => {
+                if heartbeat_health.expired() {
+                    tracing::warn!(component = "heartbeat", ack_age_ms = heartbeat_health.last_ack.elapsed().as_millis() as u64, "heartbeat confirmation timed out; releasing control");
+                    let _ = channel.send(ProtocolMessage::ReleaseAll).await;
+                    return ChannelOutcome::Reconnect("心跳超时".into());
+                }
+                if control_requested_at
+                    .is_some_and(|requested_at: Instant| requested_at.elapsed() >= CONTROL_REQUEST_TIMEOUT)
+                {
+                    control_requested_at = None;
+                    emit(events, RuntimeEvent::EnterControlResult {
+                        accepted: false,
+                        reason: Some("等待 Mac 准备键鼠控制超时".into()),
+                    }).await;
+                }
+                let sent_at_unix_ms = unix_time_ms();
+                if heartbeat_health.request_confirmation(sent_at_unix_ms) {
+                    tracing::warn!(component = "heartbeat", ack_age_ms = heartbeat_health.last_ack.elapsed().as_millis() as u64, "heartbeat delayed; requesting fresh confirmation");
+                }
+                if let Err(error) = channel.send(ProtocolMessage::Heartbeat { sent_at_unix_ms }).await {
+                    return ChannelOutcome::Reconnect(error.to_string());
+                }
+            }
+            snapshot = discovery_update(&mut discovery) => {
+                if let Some(endpoint) = replacement_endpoint(config, &snapshot, config.endpoint.as_ref()) {
+                    tracing::info!(component = "discovery", ip = %endpoint.ip, port = endpoint.port, "paired Mac address changed; reconnecting active session");
+                    mouse_movement.clear();
+                    let _ = tokio::time::timeout(HEARTBEAT_INTERVAL, channel.send(ProtocolMessage::ReleaseAll)).await;
+                    return ChannelOutcome::ReconnectNow("Mac 地址已更新，正在立即重连".into());
+                }
+            }
             command = commands.recv() => {
                 match command {
                     Some(RuntimeCommand::EnterControl { edge, position }) => {
@@ -1418,9 +1630,11 @@ async fn run_windows_session(
                     }
                     Some(RuntimeCommand::ReleaseAll) => {
                         mouse_movement.clear();
+                        control_requested_at = None;
                         let _ = channel.send(ProtocolMessage::ReleaseAll).await;
                     }
-                    Some(RuntimeCommand::ConfigureEndpoint(new_endpoint)) => {
+                    Some(RuntimeCommand::ConfigureEndpoint { endpoint: new_endpoint, automatic }) => {
+                        config.automatic_discovery = automatic;
                         let _ = channel.send(ProtocolMessage::ReleaseAll).await;
                         return ChannelOutcome::Reconfigure(new_endpoint);
                     }
@@ -1463,55 +1677,6 @@ async fn run_windows_session(
                         return ChannelOutcome::Shutdown;
                     }
                     _ => {}
-                }
-            }
-            message = channel.receive() => {
-                match message {
-                    Ok(ProtocolMessage::HeartbeatAck { sent_at_unix_ms }) => {
-                        last_ack = Instant::now();
-                        let latency = unix_time_ms().saturating_sub(sent_at_unix_ms) as f32;
-                        emit(events, RuntimeEvent::LatencyUpdated { milliseconds: latency }).await;
-                    }
-                    Ok(ProtocolMessage::EnterControlAck { accepted, reason }) => {
-                        if control_requested_at.take().is_some() {
-                            emit(events, RuntimeEvent::EnterControlResult { accepted, reason }).await;
-                        }
-                    }
-                    Ok(ProtocolMessage::ReturnControl { position }) => {
-                        control_requested_at = None;
-                        let _ = channel.send(ProtocolMessage::ReturnControlAck).await;
-                        emit(events, RuntimeEvent::ReturnControlRequested { position }).await;
-                    }
-                    Ok(ProtocolMessage::ReturnControlAck) => {
-                        emit(events, RuntimeEvent::ReturnControlAcknowledged).await;
-                    }
-                    Ok(ProtocolMessage::RemotePause { paused }) => {
-                        emit(events, RuntimeEvent::RemotePauseChanged { paused }).await;
-                    }
-                    Ok(ProtocolMessage::ReleaseAll) => {
-                        emit(events, RuntimeEvent::ReleaseAllRequested).await;
-                    }
-                    Ok(_) => {}
-                    Err(error) => return ChannelOutcome::Reconnect(error.to_string()),
-                }
-            }
-            _ = heartbeat.tick() => {
-                if last_ack.elapsed() >= HEARTBEAT_TIMEOUT {
-                    let _ = channel.send(ProtocolMessage::ReleaseAll).await;
-                    return ChannelOutcome::Reconnect("心跳超时".into());
-                }
-                if control_requested_at
-                    .is_some_and(|requested_at: Instant| requested_at.elapsed() >= CONTROL_REQUEST_TIMEOUT)
-                {
-                    control_requested_at = None;
-                    emit(events, RuntimeEvent::EnterControlResult {
-                        accepted: false,
-                        reason: Some("等待 Mac 准备键鼠控制超时".into()),
-                    }).await;
-                }
-                let sent_at_unix_ms = unix_time_ms();
-                if let Err(error) = channel.send(ProtocolMessage::Heartbeat { sent_at_unix_ms }).await {
-                    return ChannelOutcome::Reconnect(error.to_string());
                 }
             }
             event = mouse_movement.receive() => {
@@ -1583,7 +1748,25 @@ async fn run_macos_runtime(
         }
     };
 
+    let mut announcement = match LanService::advertiser() {
+        Ok(service) => Some(service),
+        Err(error) => {
+            tracing::warn!(component = "discovery", %error, "Mac LAN announcement unavailable");
+            None
+        }
+    };
+
     loop {
+        if let Some(service) = announcement.as_mut() {
+            service.announce(
+                &identity,
+                listener
+                    .as_ref()
+                    .and_then(|listener| listener.local_addr().ok())
+                    .map(|address| address.port()),
+                network_signature(),
+            );
+        }
         if listener.is_none() {
             match commands.recv().await {
                 Some(RuntimeCommand::ConfigureListenPort(port)) => {
@@ -1660,7 +1843,14 @@ async fn run_macos_runtime(
                                 emit(&events, RuntimeEvent::Offline { reason, retrying: false }).await;
                             }
                             ChannelOutcome::ReconnectNow(reason) => {
+                                if let Some(service) = announcement.as_mut() { service.withdraw(); }
                                 emit(&events, RuntimeEvent::Offline { reason, retrying: false }).await;
+                                rebind_macos_listener(
+                                    &identity,
+                                    &config,
+                                    &mut listener,
+                                    &events,
+                                ).await;
                             }
                             ChannelOutcome::Reconfigure(_) => {}
                             ChannelOutcome::Shutdown => return,
@@ -1693,20 +1883,14 @@ async fn run_macos_runtime(
                         }
                     }
                     Some(RuntimeCommand::RecoverNow(trigger)) => {
+                        if let Some(service) = announcement.as_mut() { service.withdraw(); }
                         emit_recovery_trigger(&events, trigger).await;
-                        emit(
+                        rebind_macos_listener(
+                            &identity,
+                            &config,
+                            &mut listener,
                             &events,
-                            RuntimeEvent::ListenerStarted {
-                                ip: local_ipv4_address(),
-                                port: listener
-                                    .as_ref()
-                                    .expect("listener checked")
-                                    .local_addr()
-                                    .map(|address| address.port())
-                                    .unwrap_or(config.listen_port),
-                            },
-                        )
-                        .await;
+                        ).await;
                     }
                     Some(RuntimeCommand::ClipboardUpdated) => {
                         record_current_clipboard(&clipboard, &history, &events).await;
@@ -1735,6 +1919,44 @@ async fn bind_macos_listener(
         config.trusted_peer.clone(),
     )
     .await
+}
+
+async fn rebind_macos_listener(
+    identity: &DeviceIdentity,
+    config: &MacRuntimeConfig,
+    listener: &mut Option<SecureListener>,
+    events: &mpsc::Sender<RuntimeEvent>,
+) -> bool {
+    *listener = None;
+    match bind_macos_listener(identity, config).await {
+        Ok(rebound) => {
+            let port = rebound
+                .local_addr()
+                .map(|address| address.port())
+                .unwrap_or(config.listen_port);
+            *listener = Some(rebound);
+            emit(
+                events,
+                RuntimeEvent::ListenerStarted {
+                    ip: local_ipv4_address(),
+                    port,
+                },
+            )
+            .await;
+            true
+        }
+        Err(error) => {
+            emit(
+                events,
+                RuntimeEvent::ListenerFailed {
+                    port: config.listen_port,
+                    message: error.to_string(),
+                },
+            )
+            .await;
+            false
+        }
+    }
 }
 
 async fn replace_macos_listener(
@@ -2403,7 +2625,110 @@ enum ChannelOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kvmflow_domain::{KeyAction, KeyUsage};
+    use kvmflow_domain::{EndpointRole, KeyAction, KeyUsage};
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_confirmation_recovers_brief_stall_but_not_stale_ack() {
+        let mut health = HeartbeatHealth::new();
+        assert!(!health.request_confirmation(1));
+        tokio::time::advance(HEARTBEAT_TIMEOUT).await;
+        assert!(health.request_confirmation(2));
+        assert!(!health.expired());
+        assert!(!health.acknowledge(1));
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(!health.expired());
+        assert!(health.acknowledge(2));
+        assert!(health.probe.is_none());
+        tokio::time::advance(HEARTBEAT_TIMEOUT).await;
+        assert!(health.request_confirmation(3));
+        assert!(!health.request_confirmation(4));
+        assert!(!health.acknowledge(2));
+        tokio::time::advance(HEARTBEAT_INTERVAL).await;
+        assert!(health.expired());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovered_address_wakes_backoff_and_manual_mode_ignores_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path());
+        let identity = DeviceIdentity::generate(EndpointRole::MacEndpoint, "Mac");
+        let old = NetworkEndpoint {
+            ip: "192.168.1.2".into(),
+            port: 45888,
+        };
+        let new = NetworkEndpoint {
+            ip: "192.168.1.3".into(),
+            port: 45888,
+        };
+        let config = WindowsRuntimeConfig {
+            endpoint: Some(old),
+            trusted_peer: Some(TrustedPeer::from_identity(&identity)),
+            ..Default::default()
+        };
+        let snapshot = DiscoverySnapshot {
+            available: true,
+            devices: vec![crate::discovery::DiscoveredDevice {
+                device_id: identity.device_id(),
+                device_name: "Mac".into(),
+                endpoint: new.clone(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            replacement_endpoint(&config, &snapshot, config.endpoint.as_ref()),
+            Some(new)
+        );
+        let mut manual = config.clone();
+        manual.automatic_discovery = false;
+        assert!(replacement_endpoint(&manual, &snapshot, manual.endpoint.as_ref()).is_none());
+        store.save_windows(&manual).unwrap();
+        assert!(!store.load_windows().unwrap().automatic_discovery);
+        let mut unrelated = snapshot.clone();
+        unrelated.devices[0].device_id = "another-device".into();
+        assert!(replacement_endpoint(&config, &unrelated, config.endpoint.as_ref()).is_none());
+        assert!(
+            replacement_endpoint(
+                &config,
+                &DiscoverySnapshot::default(),
+                config.endpoint.as_ref()
+            )
+            .is_none()
+        );
+        let clipboard = ClipboardMailbox::default();
+        let history = ClipboardHistoryStore::new(store.data_dir());
+        let (discovery_tx, discovery_rx) = watch::channel(DiscoverySnapshot::default());
+        let (_commands_tx, mut commands) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel(8);
+        let services = WindowsRuntimeServices {
+            discovery: Some(&discovery_rx),
+            store: &store,
+            clipboard: &clipboard,
+            history: &history,
+            events: &events,
+        };
+        let mut config = config;
+        let attempted_endpoint = config.endpoint.clone();
+        let started = Instant::now();
+        let update = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            discovery_tx.send_replace(snapshot);
+        };
+        let (result, ()) = tokio::join!(
+            windows_backoff(
+                &mut config,
+                &mut commands,
+                &services,
+                attempted_endpoint.as_ref()
+            ),
+            update
+        );
+        assert!(result);
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        let attempted_new = discovery_rx.borrow().devices[0].endpoint.clone();
+        let started = Instant::now();
+        assert!(windows_backoff(&mut config, &mut commands, &services, Some(&attempted_new)).await);
+        assert_eq!(started.elapsed(), RECONNECT_INTERVAL);
+    }
 
     #[tokio::test]
     async fn selected_windows_display_is_persisted() {
@@ -2439,6 +2764,7 @@ mod tests {
         let (command_tx, mut commands) = mpsc::channel(1);
         let (events, _received_events) = mpsc::channel(1);
         let services = WindowsRuntimeServices {
+            discovery: None,
             store: &store,
             clipboard: &clipboard,
             history: &history,
@@ -2451,8 +2777,41 @@ mod tests {
             .expect("queue immediate recovery");
 
         let started_at = Instant::now();
-        assert!(windows_backoff(&mut config, &mut commands, &services).await);
+        assert!(windows_backoff(&mut config, &mut commands, &services, None).await);
         assert_eq!(Instant::now(), started_at);
+    }
+
+    #[tokio::test]
+    async fn macos_recovery_rebinds_the_configured_listener_port() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve temporary port")
+            .local_addr()
+            .expect("temporary listener address")
+            .port();
+        let identity = DeviceIdentity::generate(EndpointRole::MacEndpoint, "Recovery Mac");
+        let config = MacRuntimeConfig {
+            listen_port: port,
+            ..MacRuntimeConfig::default()
+        };
+        let mut listener = Some(
+            bind_macos_listener(&identity, &config)
+                .await
+                .expect("bind initial listener"),
+        );
+        let (events, mut received_events) = mpsc::channel(1);
+
+        assert!(rebind_macos_listener(&identity, &config, &mut listener, &events).await);
+        assert!(matches!(
+            received_events.recv().await,
+            Some(RuntimeEvent::ListenerStarted { port: actual, .. }) if actual == port
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        )
+        .await
+        .expect("listener connection timeout")
+        .expect("connect to rebound listener");
     }
 
     #[test]
@@ -2502,6 +2861,7 @@ mod tests {
             command_tx,
             mouse_movement: Some(mouse_movement_tx),
             clipboard: ClipboardMailbox::default(),
+            discovery: None,
         };
 
         handle
@@ -2587,6 +2947,7 @@ mod tests {
             command_tx,
             mouse_movement: Some(mouse_movement_tx),
             clipboard: ClipboardMailbox::default(),
+            discovery: None,
         };
         drop(commands);
 

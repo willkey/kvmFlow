@@ -9,12 +9,15 @@ import {
   configureListenPort,
   confirmPairing,
   exportFoundationReport,
+  getAutostartEnabled,
   getInitialSnapshot,
   listenForSnapshots,
   openAccessibilitySettings,
   refreshAccessibilityPermission,
   rejectPairing,
+  resetInput,
   returnControl,
+  setAutostartEnabled,
   setEmergencyStopActive,
 } from "./engineBridge";
 import brandMark from "../../../../assets/brand/kvmflow-mark.svg";
@@ -66,11 +69,14 @@ export default function App() {
   const [snapshotErrorMessage, setSnapshotErrorMessage] = useState<string | null>(null);
   const [exportErrorMessage, setExportErrorMessage] = useState<string | null>(null);
   const [listenerErrorMessage, setListenerErrorMessage] = useState<string | null>(null);
+  const [preferenceErrorMessage, setPreferenceErrorMessage] = useState<string | null>(null);
   const [reportPath, setReportPath] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [commandErrorMessage, setCommandErrorMessage] = useState<string | null>(null);
   const [portDraft, setPortDraft] = useState("45888");
   const [isCommandPending, setIsCommandPending] = useState(false);
+  const [resetNotice, setResetNotice] = useState<string | null>(null);
+  const [autostartEnabled, setAutostartEnabledState] = useState<boolean | null>(null);
   const seededPortForm = useRef(false);
 
   useEffect(() => {
@@ -102,6 +108,19 @@ export default function App() {
       .catch(() => {
         if (isCurrent && !receivedSnapshotSinceInitialRequest) {
           setSnapshotErrorMessage("无法加载状态");
+        }
+      });
+
+    void getAutostartEnabled()
+      .then((enabled) => {
+        if (isCurrent) {
+          setAutostartEnabledState(enabled);
+          setPreferenceErrorMessage(null);
+        }
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setPreferenceErrorMessage("无法读取开机自启动设置");
         }
       });
 
@@ -150,6 +169,7 @@ export default function App() {
   };
 
   const runCommand = async (command: () => Promise<void>) => {
+    setResetNotice(null);
     setIsCommandPending(true);
     setCommandErrorMessage(null);
     try {
@@ -174,6 +194,7 @@ export default function App() {
   const status = snapshot ? macStatus(snapshot) : "正在加载";
   const errorMessages = [
     { source: "listener", message: listenerErrorMessage },
+    { source: "preference", message: preferenceErrorMessage },
     { source: "snapshot", message: snapshotErrorMessage },
     { source: "export", message: exportErrorMessage },
     { source: "command", message: commandErrorMessage },
@@ -190,6 +211,14 @@ export default function App() {
           </div>
         </div>
         <div className="header-actions">
+          <button className="export-command reset-command" type="button"
+            title="释放双端按键并返回 Windows"
+            onClick={() => void runCommand(async () => {
+              await resetInput();
+              setResetNotice("重置请求已发送，控制会返回 Windows。");
+            })} disabled={isCommandPending || !snapshot}>
+            重置按键状态
+          </button>
           <span className={`link-badge link-badge--${snapshot?.kvm.link ?? "idle"}`}>
             <i aria-hidden="true" />
             {snapshot?.kvm.link === "online" ? "已连接" : "等待连接"}
@@ -225,6 +254,8 @@ export default function App() {
           {reportPath}
         </output>
       ) : null}
+
+      {resetNotice ? <p className="reset-notice" role="status">{resetNotice}</p> : null}
 
       <section className="connection-section" aria-labelledby="connection-heading">
         <div className="section-heading">
@@ -364,6 +395,25 @@ export default function App() {
             <span>{snapshot.kvm.lastError.recovery}</span>
           </div>
         ) : null}
+
+        <label className="autostart-toggle">
+          <span>
+            <strong>开机自动启动</strong>
+            <small>登录 Mac 后在菜单栏后台启动，不主动打开主窗口。</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={autostartEnabled ?? false}
+            onChange={(event) => {
+              const enabled = event.currentTarget.checked;
+              void runCommand(async () => {
+                setAutostartEnabledState(await setAutostartEnabled(enabled));
+                setPreferenceErrorMessage(null);
+              });
+            }}
+            disabled={isCommandPending || autostartEnabled === null}
+          />
+        </label>
 
         {snapshot && snapshot.kvm.permission !== "granted" ? (
           <div className="permission-panel">

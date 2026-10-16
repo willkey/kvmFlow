@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -27,6 +28,18 @@ mod window;
 
 struct LoggingGuardOwner {
     _guard: Mutex<LoggingGuard>,
+}
+
+const AUTOSTART_ARGUMENT: &str = "--autostart";
+
+fn launched_from_autostart<I, S>(arguments: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    arguments
+        .into_iter()
+        .any(|argument| argument.as_ref() == OsStr::new(AUTOSTART_ARGUMENT))
 }
 
 fn storage_notice(prepared: &PreparedStorage) -> Option<DiagnosticNotice> {
@@ -247,6 +260,10 @@ fn spawn_production_engine(
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+    let autostart_launch = launched_from_autostart(std::env::args_os());
     let build = BuildInfo {
         version: env!("CARGO_PKG_VERSION").into(),
         build_id: option_env!("KVMFLOW_BUILD_ID").unwrap_or("dev").into(),
@@ -282,6 +299,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         storage_root = %prepared.layout.root.display(),
         storage_fallback = prepared.layout.fallback_used,
         legacy_storage_migrated = migrated,
+        autostart_launch,
         "kvmFlow started"
     );
     let diagnostic_notice = storage_notice(&prepared);
@@ -298,7 +316,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(engine.clone());
     start_snapshot_emitter(app.handle(), &engine);
     menu_bar::create_menu_bar(app.handle(), &engine)?;
-    window::ensure_main_window(app.handle(), &engine)?;
+    if !autostart_launch {
+        window::ensure_main_window(app.handle(), &engine)?;
+    }
 
     Ok(())
 }
@@ -306,6 +326,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         commands::get_snapshot,
+        commands::get_autostart_enabled,
+        commands::set_autostart_enabled,
         commands::export_foundation_report,
         commands::configure_listen_port,
         commands::confirm_pairing,
@@ -313,7 +335,8 @@ fn configure_builder<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Bu
         commands::set_local_control_allowed,
         commands::refresh_accessibility_permission,
         commands::open_accessibility_settings,
-        commands::return_control
+        commands::return_control,
+        commands::reset_input
     ])
 }
 
@@ -343,26 +366,25 @@ fn show_existing_instance(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
-        |app, _arguments, _working_directory| show_existing_instance(app),
-    ));
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _working_directory| show_existing_instance(app),
+        ))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![AUTOSTART_ARGUMENT]),
+        ));
     let app = configure_builder(builder.setup(setup))
         .build(tauri::generate_context!())
         .expect("failed to build kvmFlow macOS application");
 
-    app.run(|app, event| match event {
-        tauri::RunEvent::ExitRequested {
+    app.run(|_, event| {
+        if let tauri::RunEvent::ExitRequested {
             code: None, api, ..
-        } => api.prevent_exit(),
-        tauri::RunEvent::Resumed => {
-            let engine = app.state::<EngineHandle>().inner().clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = engine
-                    .send(kvmflow_engine::EngineCommand::RecoverConnectionNow)
-                    .await;
-            });
+        } = event
+        {
+            api.prevent_exit();
         }
-        _ => {}
     });
 }
 
@@ -432,9 +454,15 @@ mod tests {
     use tokio::sync::{mpsc, watch};
 
     use super::{
-        LoggingGuardOwner, forward_snapshots, migrate_legacy_runtime, spawn_startup_engine,
-        storage_notice, test_support::snapshot,
+        LoggingGuardOwner, forward_snapshots, launched_from_autostart, migrate_legacy_runtime,
+        spawn_startup_engine, storage_notice, test_support::snapshot,
     };
+
+    #[test]
+    fn autostart_argument_is_detected_without_hiding_manual_launches() {
+        assert!(launched_from_autostart(["kvmFlow", "--autostart"]));
+        assert!(!launched_from_autostart(["kvmFlow"]));
+    }
 
     fn project_path(path: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
@@ -545,11 +573,17 @@ mod tests {
     }
 
     #[test]
-    fn info_plist_is_empty_and_declares_no_permissions() {
+    fn info_plist_declares_a_menu_bar_application() {
         let plist = PlistValue::from_file(project_path("Info.plist")).expect("parse Info.plist");
         let dictionary = plist.as_dictionary().expect("Info.plist dictionary");
 
-        assert!(dictionary.is_empty());
+        assert_eq!(
+            dictionary
+                .get("LSUIElement")
+                .and_then(PlistValue::as_boolean),
+            Some(true)
+        );
+        assert!(!dictionary.contains_key("LSBackgroundOnly"));
     }
 
     #[test]
